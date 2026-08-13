@@ -30,7 +30,7 @@ External APIs Called
 - Jira REST API v2
     - POST /rest/api/2/search  – Search JEJQ issues (text ~ operator)
     - GET /rest/api/2/issue/{key}  – Fetch JEJQ issue details
-- LLM Gateway (JNJClaudeGatewayModel)
+- LLM Gateway (ClaudeGatewayModel)
     - POST /predict  – Generate root cause reasoning with evidence context
 
 Evidence Ranking Algorithm
@@ -104,7 +104,7 @@ Environment Variables
 Secrets (Databricks secret scope "collibra", or config.py fallback)
 --------------------------------------------------------------------
 - jira_url / jira_api_token / jira_ca_bundle
-- jnj_gateway_url / jnj_gateway_key  (Claude gateway for LLM)
+- gateway_url / gateway_key  (Claude gateway for LLM)
 - uc_catalog / uc_schema
 
 Signal Extraction Patterns
@@ -123,7 +123,7 @@ TO-DO
 2) Pull JGPV description and extract DQ signals (dataset, table, run_dt, row_count_direction).
 3) Query JEJQ evidence via search + graph augmentation.
 4) Score and rank JEJQ candidates deterministically.
-5) Use JNJ model to summarize top-ranked root causes (only if high confidence).
+5) Use GenAI model to summarize top-ranked root causes (only if high confidence).
 6) Enrich JGPV ticket description and add comment (high confidence only).
 """
 
@@ -142,7 +142,7 @@ import urllib3
 from pydantic import BaseModel, Field
 
 import config
-from jnj_strands_model import JNJClaudeGatewayModel
+from strands_model import ClaudeGatewayModel
 from pipeline_io import PipelineIO
 
 try:
@@ -1009,7 +1009,7 @@ def diagnose_with_agent(
     """Generate structured root-cause diagnosis from ranked JEJQ evidence.
 
     This function converts top-ranked upstream evidence issues into a compact
-    textual context, builds an instruction prompt, and asks the JNJ Claude
+    textual context, builds an instruction prompt, and asks the Claude
     gateway model to return a validated ``DiagnosisResult``.
 
     Prompt behavior enforced here:
@@ -1064,8 +1064,8 @@ Task:
 Note that CN region is separated from APAC, so unless the affected table is in pixonomy db, do not include CN region tickets in suspected_upstream_tickets. 
 """.strip()
 
-    model = JNJClaudeGatewayModel(
-        api_key=_load_secret_or_default("JNJ_GENAI_API_KEY", config.JNJ_GENAI_API_KEY),
+    model = ClaudeGatewayModel(
+        api_key=_load_secret_or_default("GENAI_API_KEY", config.GENAI_API_KEY),
         temperature=0.1,
         max_tokens=1500,
     )
