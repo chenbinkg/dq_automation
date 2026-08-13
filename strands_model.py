@@ -54,9 +54,9 @@ class BookAnalysis(BaseModel):
     summary: str = Field(description="Brief summary of the book")
     rating: int = Field(description="Rating from 1-10", ge=1, le=10)
 
-class JNJClaudeGatewayModel(Model):
+class ClaudeGatewayModel(Model):
     """
-    Custom Strands model provider for J&J GenAI Gateway.
+    Custom Strands model provider for GenAI Gateway.
 
     Tested against the Strands 1.47.0 Model.stream signature:
 
@@ -91,19 +91,19 @@ class JNJClaudeGatewayModel(Model):
         self,
         api_key: str | None = None,
         model_id: str = "global.anthropic.claude-sonnet-4-6",
-        base_url: str = "https://genaiapigwna.jnj.com",
+        base_url: str = "https://genaiapigwna.com",
         max_tokens: int = 4096,
         temperature: float = 0.5,
         timeout: int = 120,
         anthropic_version: str = "bedrock-2023-05-31",
     ):
         self.api_key = api_key or _load_secret_or_default(
-            "JNJ_GENAI_API_KEY", os.getenv("JNJ_GENAI_API_KEY")
+            "GENAI_API_KEY", os.getenv("GENAI_API_KEY")
         )
         if not self.api_key:
             raise ValueError(
-                "Missing API key. Set api_key=..., JNJ_GENAI_API_KEY env var, "
-                "or Databricks secret key JNJ_GENAI_API_KEY."
+                "Missing API key. Set api_key=..., GENAI_API_KEY env var, "
+                "or Databricks secret key GENAI_API_KEY."
             )
 
         self.model_id = model_id
@@ -759,10 +759,10 @@ class JNJClaudeGatewayModel(Model):
 # import os
 # from strands import Agent
 
-# from jnj_strands_model import JNJClaudeGatewayModel
+# from strands_model import ClaudeGatewayModel
 
 
-# model = JNJClaudeGatewayModel(api_key=os.getenv("JNJ_GENAI_API_KEY"),max_tokens=1024,temperature=0.5)
+# model = ClaudeGatewayModel(api_key=os.getenv("GENAI_API_KEY"),max_tokens=1024,temperature=0.5)
 
 # agent = Agent(model=model,system_prompt="You are a helpful assistant.")
 
@@ -775,7 +775,7 @@ class JNJClaudeGatewayModel(Model):
 
 # from pydantic import BaseModel, Field
 
-# from jnj_strands_model import JNJClaudeGatewayModel
+# from strands_model import ClaudeGatewayModel
 
 
 # class BookAnalysis(BaseModel):
@@ -788,7 +788,7 @@ class JNJClaudeGatewayModel(Model):
 #     rating: int = Field(description="Rating from 1-10", ge=1, le=10)
 
 
-# model = JNJClaudeGatewayModel(
+# model = ClaudeGatewayModel(
 #     model_id="global.anthropic.claude-sonnet-4-6",
 # )
 
@@ -814,7 +814,7 @@ class JNJClaudeGatewayModel(Model):
 # from pydantic import BaseModel, Field
 # from strands import Agent
 
-# from jnj_strands_model import JNJClaudeGatewayModel
+# from strands_model import ClaudeGatewayModel
 
 
 # class BookAnalysis(BaseModel):
@@ -825,7 +825,7 @@ class JNJClaudeGatewayModel(Model):
 #     rating: int = Field(description="Rating from 1-10", ge=1, le=10)
 
 
-# model = JNJClaudeGatewayModel(model_id="global.anthropic.claude-sonnet-4-6", api_key=os.getenv("JNJ_GENAI_API_KEY"))
+# model = ClaudeGatewayModel(model_id="global.anthropic.claude-sonnet-4-6", api_key=os.getenv("GENAI_API_KEY"))
 
 # agent = Agent(
 #     model=model,
