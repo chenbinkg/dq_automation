@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import re
 import uuid
@@ -7,6 +8,12 @@ from typing import Any, AsyncGenerator
 
 import requests
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+
+class _ToolsUnsupportedError(RuntimeError):
+    """Raised when the gateway rejects a native ``tools`` payload."""
 
 try:
     from strands.models import Model
@@ -45,18 +52,10 @@ def _load_secret_or_default(key: str, default: Any = None) -> Any:
     except Exception:
         return default
 
-class BookAnalysis(BaseModel):
-    """Analyze a book's key information."""
 
-    title: str = Field(description="The book's title")
-    author: str = Field(description="The book's author")
-    genre: str = Field(description="Primary genre or category")
-    summary: str = Field(description="Brief summary of the book")
-    rating: int = Field(description="Rating from 1-10", ge=1, le=10)
-
-class ClaudeGatewayModel(Model):
+class JNJClaudeGatewayModel(Model):
     """
-    Custom Strands model provider for GenAI Gateway.
+    Custom Strands model provider for J&J GenAI Gateway.
 
     Tested against the Strands 1.47.0 Model.stream signature:
 
@@ -91,19 +90,19 @@ class ClaudeGatewayModel(Model):
         self,
         api_key: str | None = None,
         model_id: str = "global.anthropic.claude-sonnet-4-6",
-        base_url: str = "https://genaiapigwna.com",
+        base_url: str = "https://genaiapigwna.jnj.com",
         max_tokens: int = 4096,
         temperature: float = 0.5,
         timeout: int = 120,
         anthropic_version: str = "bedrock-2023-05-31",
     ):
         self.api_key = api_key or _load_secret_or_default(
-            "GENAI_API_KEY", os.getenv("GENAI_API_KEY")
+            "JNJ_GENAI_API_KEY", os.getenv("JNJ_GENAI_API_KEY")
         )
         if not self.api_key:
             raise ValueError(
-                "Missing API key. Set api_key=..., GENAI_API_KEY env var, "
-                "or Databricks secret key GENAI_API_KEY."
+                "Missing API key. Set api_key=..., JNJ_GENAI_API_KEY env var, "
+                "or Databricks secret key JNJ_GENAI_API_KEY."
             )
 
         self.model_id = model_id
@@ -112,6 +111,8 @@ class ClaudeGatewayModel(Model):
         self.temperature = temperature
         self.timeout = timeout
         self.anthropic_version = anthropic_version
+        # None = untried; False once the gateway has rejected a tools payload.
+        self._tools_supported: bool | None = None
 
     # ---------------------------------------------------------------------
     # Required by strands.models.Model
@@ -163,10 +164,14 @@ class ClaudeGatewayModel(Model):
         For normal Agent(...) calls:
           yields Bedrock Converse-style text stream events.
 
-        For structured_output_model=...:
-          Strands usually registers a one-off dynamic tool and forces the model
-          to call it. This implementation detects that pattern and emits a
-          toolUse stream event with validated JSON input.
+        When tool_specs are supplied (MCP tools, structured-output tools, or
+        both), the specs are forwarded to the gateway as native Anthropic
+        ``tools`` so the model can genuinely call them. Any ``tool_use`` blocks
+        returned by the model are emitted as toolUse stream events for the
+        Strands event loop to execute.
+
+        If the gateway rejects a tools payload, this falls back to the legacy
+        prompt-based JSON path so structured output keeps working.
         """
 
         effective_system_prompt = self._merge_system_prompt(
@@ -174,9 +179,30 @@ class ClaudeGatewayModel(Model):
             system_prompt_content=system_prompt_content,
         )
 
-        # If Strands sends a forced/single tool spec, handle it as a structured-output tool.
-        # This is what enables:
-        #   result = agent("...", structured_output_model=BookAnalysis)
+        if tool_specs and self._tools_supported is not False:
+            try:
+                response = await asyncio.to_thread(
+                    self._invoke_with_tools,
+                    messages,
+                    tool_specs,
+                    effective_system_prompt,
+                    tool_choice,
+                    kwargs,
+                )
+            except _ToolsUnsupportedError as exc:
+                self._tools_supported = False
+                logger.warning(
+                    "J&J gateway rejected native tool calling; falling back to "
+                    "prompt-based structured output. Detail: %s",
+                    exc,
+                )
+            else:
+                self._tools_supported = True
+                for event in self._response_to_stream_events(response):
+                    yield event
+                return
+
+        # Fallback: legacy structured-output-only handling via prompted JSON.
         if tool_specs:
             tool_spec = self._pick_structured_output_tool(tool_specs, tool_choice)
 
@@ -257,6 +283,75 @@ class ClaudeGatewayModel(Model):
         result = self._post(payload)
         return self._extract_text(result)
 
+    def _invoke_with_tools(
+        self,
+        messages,
+        tool_specs: list[dict[str, Any]],
+        system_prompt: str | None,
+        tool_choice: dict[str, Any] | None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Invoke the gateway with native Anthropic tool calling enabled."""
+        payload = self._build_payload(
+            messages=messages,
+            system_prompt=system_prompt,
+            extra_payload=extra_payload,
+            tool_specs=tool_specs,
+            tool_choice=tool_choice,
+        )
+
+        try:
+            return self._post(payload)
+        except RuntimeError as exc:
+            if self._looks_like_tools_unsupported(str(exc)):
+                raise _ToolsUnsupportedError(str(exc)) from exc
+            raise
+
+    @staticmethod
+    def _looks_like_tools_unsupported(error_text: str) -> bool:
+        """Heuristically detect a gateway rejection of the tools payload."""
+        lowered = error_text.lower()
+        if "status=400" not in lowered:
+            return False
+        return any(
+            token in lowered
+            for token in ("tools", "tool_choice", "input_schema", "tool_use")
+        )
+
+    def _to_anthropic_tools(self, tool_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        tools: list[dict[str, Any]] = []
+
+        for spec in tool_specs:
+            name, schema = self._normalise_tool_spec(spec)
+            inner = spec.get("toolSpec", spec)
+            tools.append(
+                {
+                    "name": name,
+                    "description": inner.get("description") or name,
+                    "input_schema": schema,
+                }
+            )
+
+        return tools
+
+    @staticmethod
+    def _to_anthropic_tool_choice(tool_choice: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(tool_choice, dict):
+            return None
+
+        chosen = tool_choice.get("tool")
+        if isinstance(chosen, dict) and chosen.get("name"):
+            return {"type": "tool", "name": chosen["name"]}
+
+        if "any" in tool_choice:
+            return {"type": "any"}
+        if "auto" in tool_choice:
+            return {"type": "auto"}
+        if tool_choice.get("name"):
+            return {"type": "tool", "name": tool_choice["name"]}
+
+        return None
+
     def _generate_json_object(
         self,
         prompt: str,
@@ -306,6 +401,8 @@ class ClaudeGatewayModel(Model):
         messages,
         system_prompt: str | None = None,
         extra_payload: dict[str, Any] | None = None,
+        tool_specs: list[dict[str, Any]] | None = None,
+        tool_choice: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "anthropic_version": self.anthropic_version,
@@ -316,6 +413,12 @@ class ClaudeGatewayModel(Model):
 
         if system_prompt:
             payload["system"] = system_prompt
+
+        if tool_specs:
+            payload["tools"] = self._to_anthropic_tools(tool_specs)
+            anthropic_tool_choice = self._to_anthropic_tool_choice(tool_choice)
+            if anthropic_tool_choice:
+                payload["tool_choice"] = anthropic_tool_choice
 
         # Allow only known generation controls from per-call kwargs.
         # Strands may pass internal fields (for example "model_state") that
@@ -476,89 +579,213 @@ class ClaudeGatewayModel(Model):
     # ---------------------------------------------------------------------
     # Message conversion
     # ---------------------------------------------------------------------
+    _ANTHROPIC_STOP_REASONS = {
+        "end_turn": "end_turn",
+        "tool_use": "tool_use",
+        "max_tokens": "max_tokens",
+        "stop_sequence": "stop_sequence",
+    }
+
+    def _response_to_stream_events(self, response: dict[str, Any]):
+        """Translate a native Anthropic response into Strands stream events.
+
+        Emits a contentBlock per text / tool_use block so the Strands event loop
+        can dispatch tool calls and continue the conversation.
+        """
+        content = response.get("content")
+        if not isinstance(content, list):
+            content = []
+
+        yield {"messageStart": {"role": "assistant"}}
+
+        block_index = 0
+        saw_tool_use = False
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+
+            block_type = block.get("type")
+
+            if block_type == "text":
+                text = block.get("text") or ""
+                if not text:
+                    continue
+                yield {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": block_index,
+                        "delta": {"text": text},
+                    }
+                }
+                yield {"contentBlockStop": {"contentBlockIndex": block_index}}
+                block_index += 1
+
+            elif block_type == "tool_use":
+                saw_tool_use = True
+                yield {
+                    "contentBlockStart": {
+                        "contentBlockIndex": block_index,
+                        "start": {
+                            "toolUse": {
+                                "toolUseId": block.get("id") or f"tooluse_{uuid.uuid4().hex}",
+                                "name": block.get("name"),
+                            }
+                        },
+                    }
+                }
+                yield {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": block_index,
+                        "delta": {
+                            "toolUse": {
+                                "input": json.dumps(
+                                    block.get("input") or {}, ensure_ascii=False
+                                )
+                            }
+                        },
+                    }
+                }
+                yield {"contentBlockStop": {"contentBlockIndex": block_index}}
+                block_index += 1
+
+        raw_stop = str(response.get("stop_reason") or "").strip()
+        stop_reason = self._ANTHROPIC_STOP_REASONS.get(
+            raw_stop, "tool_use" if saw_tool_use else "end_turn"
+        )
+
+        yield {"messageStop": {"stopReason": stop_reason}}
+        yield {"metadata": self._extract_usage_metadata(response)}
+
+    @staticmethod
+    def _extract_usage_metadata(response: dict[str, Any]) -> dict[str, Any]:
+        usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+
+        return {
+            "usage": {
+                "inputTokens": input_tokens,
+                "outputTokens": output_tokens,
+                "totalTokens": input_tokens + output_tokens,
+            },
+            "metrics": {"latencyMs": 0},
+        }
+
     def _normalise_messages_for_anthropic(self, messages) -> list[dict[str, Any]]:
         """
-        Converts Strands/Bedrock-style messages into the format accepted by
-        your working gateway example.
+        Converts Strands/Bedrock-style messages into native Anthropic content
+        blocks, preserving tool_use / tool_result structure so multi-turn tool
+        calling works.
 
         Handles:
           - {"role": "user", "content": "text"}
           - {"role": "user", "content": [{"text": "..."}]}
-          - assistant text blocks
-          - tool result blocks, converted to text for compatibility
+          - assistant toolUse blocks   -> Anthropic "tool_use"
+          - user toolResult blocks     -> Anthropic "tool_result"
         """
 
-        normalised = []
+        normalised: list[dict[str, Any]] = []
 
         for message in messages:
             role = message.get("role", "user")
             content = message.get("content", "")
 
-            if isinstance(content, str):
-                text = content
-            elif isinstance(content, list):
-                text_parts = []
+            blocks: list[dict[str, Any]] = []
 
+            if isinstance(content, str):
+                if content:
+                    blocks.append({"type": "text", "text": content})
+
+            elif isinstance(content, list):
                 for block in content:
                     if not isinstance(block, dict):
-                        text_parts.append(str(block))
+                        blocks.append({"type": "text", "text": str(block)})
                         continue
 
                     if "text" in block:
-                        text_parts.append(block["text"])
-
-                    elif "toolResult" in block:
-                        tool_result = block["toolResult"]
-                        text_parts.append(
-                            "Tool result:\n"
-                            + json.dumps(tool_result, ensure_ascii=False)
-                        )
+                        if block["text"]:
+                            blocks.append({"type": "text", "text": block["text"]})
 
                     elif "toolUse" in block:
-                        tool_use = block["toolUse"]
-                        text_parts.append(
-                            "Tool use:\n"
-                            + json.dumps(tool_use, ensure_ascii=False)
+                        tool_use = block["toolUse"] or {}
+                        blocks.append(
+                            {
+                                "type": "tool_use",
+                                "id": tool_use.get("toolUseId"),
+                                "name": tool_use.get("name"),
+                                "input": tool_use.get("input") or {},
+                            }
                         )
 
+                    elif "toolResult" in block:
+                        blocks.append(self._to_anthropic_tool_result(block["toolResult"]))
+
                     else:
-                        text_parts.append(json.dumps(block, ensure_ascii=False))
+                        blocks.append(
+                            {"type": "text", "text": json.dumps(block, ensure_ascii=False)}
+                        )
 
-                text = "\n".join(part for part in text_parts if part)
+            elif content:
+                blocks.append({"type": "text", "text": str(content)})
 
-            else:
-                text = str(content)
+            if not blocks:
+                continue
 
-            # Anthropic usually allows user/assistant roles.
-            # If anything else appears, make it user text.
+            # Anthropic accepts only user/assistant roles.
             if role not in {"user", "assistant"}:
                 role = "user"
 
-            normalised.append(
-                {
-                    "role": role,
-                    "content": text,
-                }
-            )
+            # Merge consecutive same-role messages; Anthropic requires alternation.
+            if normalised and normalised[-1]["role"] == role:
+                normalised[-1]["content"].extend(blocks)
+            else:
+                normalised.append({"role": role, "content": blocks})
 
-        # Anthropic requires messages to start with user in most cases.
+        # Anthropic requires the conversation to start with a user message.
         if normalised and normalised[0]["role"] == "assistant":
             normalised.insert(
                 0,
-                {
-                    "role": "user",
-                    "content": "Continue.",
-                },
+                {"role": "user", "content": [{"type": "text", "text": "Continue."}]},
             )
 
         return normalised
 
+    @staticmethod
+    def _to_anthropic_tool_result(tool_result: dict[str, Any] | None) -> dict[str, Any]:
+        tool_result = tool_result or {}
+
+        text_parts: list[str] = []
+        for item in tool_result.get("content") or []:
+            if not isinstance(item, dict):
+                text_parts.append(str(item))
+            elif "text" in item:
+                text_parts.append(str(item["text"]))
+            elif "json" in item:
+                text_parts.append(json.dumps(item["json"], ensure_ascii=False))
+            else:
+                text_parts.append(json.dumps(item, ensure_ascii=False))
+
+        return {
+            "type": "tool_result",
+            "tool_use_id": tool_result.get("toolUseId"),
+            "content": [{"type": "text", "text": "\n".join(text_parts) or "(no output)"}],
+            "is_error": str(tool_result.get("status") or "").lower() == "error",
+        }
+
     def _messages_to_plain_prompt(self, messages) -> str:
         converted = self._normalise_messages_for_anthropic(messages)
-        return "\n\n".join(
-            f"{message['role'].upper()}: {message['content']}"
-            for message in converted
-        )
+
+        lines: list[str] = []
+        for message in converted:
+            parts: list[str] = []
+            for block in message["content"]:
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                else:
+                    parts.append(json.dumps(block, ensure_ascii=False))
+            lines.append(f"{message['role'].upper()}: " + "\n".join(parts))
+
+        return "\n\n".join(lines)
 
     def _merge_system_prompt(
         self,
@@ -759,10 +986,10 @@ class ClaudeGatewayModel(Model):
 # import os
 # from strands import Agent
 
-# from strands_model import ClaudeGatewayModel
+# from jnj_strands_model import JNJClaudeGatewayModel
 
 
-# model = ClaudeGatewayModel(api_key=os.getenv("GENAI_API_KEY"),max_tokens=1024,temperature=0.5)
+# model = JNJClaudeGatewayModel(api_key=os.getenv("JNJ_GENAI_API_KEY"),max_tokens=1024,temperature=0.5)
 
 # agent = Agent(model=model,system_prompt="You are a helpful assistant.")
 
@@ -771,50 +998,13 @@ class ClaudeGatewayModel(Model):
 # print(result)
 
 
-# '''------------ Usage: direct model.structured_output(...) ------------'''
-
-# from pydantic import BaseModel, Field
-
-# from strands_model import ClaudeGatewayModel
-
-
-# class BookAnalysis(BaseModel):
-#     """Analyze a book's key information."""
-
-#     title: str = Field(description="The book's title")
-#     author: str = Field(description="The book's author")
-#     genre: str = Field(description="Primary genre or category")
-#     summary: str = Field(description="Brief summary of the book")
-#     rating: int = Field(description="Rating from 1-10", ge=1, le=10)
-
-
-# model = ClaudeGatewayModel(
-#     model_id="global.anthropic.claude-sonnet-4-6",
-# )
-
-# result = model.structured_output(
-#     BookAnalysis,
-#     """
-#     Analyze this book: "The Hitchhiker's Guide to the Galaxy" by Douglas Adams.
-#     It's a science fiction comedy about Arthur Dent's adventures through space
-#     after Earth is destroyed. It's widely considered a classic of humorous sci-fi.
-#     """,
-# )
-
-# print(result)
-# print(result.title)
-# print(result.author)
-# print(result.genre)
-# print(result.rating)
-
-
 # '''------------ Usage: direct model.structured_output(...) 
 # For Strands 1.x, the more current pattern is usually this: ------------'''
 
 # from pydantic import BaseModel, Field
 # from strands import Agent
 
-# from strands_model import ClaudeGatewayModel
+# from jnj_strands_model import JNJClaudeGatewayModel
 
 
 # class BookAnalysis(BaseModel):
@@ -825,7 +1015,7 @@ class ClaudeGatewayModel(Model):
 #     rating: int = Field(description="Rating from 1-10", ge=1, le=10)
 
 
-# model = ClaudeGatewayModel(model_id="global.anthropic.claude-sonnet-4-6", api_key=os.getenv("GENAI_API_KEY"))
+# model = JNJClaudeGatewayModel(model_id="global.anthropic.claude-sonnet-4-6", api_key=os.getenv("JNJ_GENAI_API_KEY"))
 
 # agent = Agent(
 #     model=model,
