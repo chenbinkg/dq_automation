@@ -35,7 +35,6 @@ flowchart TD
     S1[S1 Query Datasets and BU]
     S2[S2 Query Dataset Details]
     S3[S3 Prepare JJDMC Report]
-    S4[S4 Publish to Tableau (Optional)]
     S5[S5 Generate Potential JIRA Tickets]
     S6[S6 Create/Reopen JIRA Tickets]
     S7[S7 Invalidate Adaptive Breaks]
