@@ -1,0 +1,185 @@
+# Databricks Automation Bundle for DQ Automation Pipeline
+# Defines a multi-stage data quality automation workflow
+# See https://docs.databricks.com/dev-tools/bundles/index.html
+
+bundle:
+  name: dq_automation
+
+targets:
+  dev:
+    mode: development
+    workspace:
+      host: https://dbc-1a2fed98-ca15.cloud.databricks.com
+  prod:
+    mode: production
+    workspace:
+      host: https://dbc-1d2e2f8a-2140.cloud.databricks.com
+
+variables:
+  spark_version:
+    default: "14.3.x-scala2.12"
+  node_type:
+    default: "i3.xlarge"
+  num_workers:
+    default: 1
+  timeout_seconds:
+    default: 3600
+
+resources:
+  jobs:
+    dq_automation_pipeline:
+      name: dq_automation_pipeline
+      description: "Multi-stage data quality automation pipeline (S1-S9)"
+      schedule:
+        quartz_cron_expression: "0 5 9 ? * MON-FRI"  # Weekdays at 9:05 AM Singapore time
+        timezone_id: "Asia/Singapore"
+        pause_status: UNPAUSED
+
+      permissions:
+        - level: CAN_VIEW
+          group_name: users
+        - level: CAN_MANAGE
+          user_name: mchen154@its.jnj.com
+
+      tasks:
+        # Stage 1: Query Datasets and Business Units from Collibra
+        - task_key: s1_query_dataset_and_bu
+          description: "S1: Fetch datasets and business unit mappings from Collibra CDQ API"
+          spark_python_task:
+            python_file: ./s1_query_dataset_and_bu.py
+          existing_cluster_id: 1023-021822-wqfpujup
+          libraries:
+            - pypi:
+                package: python-dotenv==1.1.1
+        
+        # Stage 2: Query Dataset Details from Collibra
+        - task_key: s2_query_dataset_details
+          description: "S2: Fetch detailed DQ findings and dataset definitions from Collibra"
+          depends_on:
+            - task_key: s1_query_dataset_and_bu
+          spark_python_task:
+            python_file: ./s2_query_dataset_details.py
+          existing_cluster_id: 1023-021822-wqfpujup
+          libraries:
+            - pypi:
+                package: python-dotenv==1.1.1
+
+        # Stage 3:Prepare JJDMC Report
+        - task_key: s3_prepare_jjdmc_report
+          description: "S3: Prepare JJDMC enrichment report"
+          depends_on:
+            - task_key: s2_query_dataset_details
+          spark_python_task:
+            python_file: ./s3_prepare_jjdmc_report.py
+          existing_cluster_id: 1023-021822-wqfpujup
+          libraries:
+            - pypi:
+                package: python-dotenv==1.1.1
+        
+        # # Stage 4: Publish Report to Tableau
+        # - task_key: s4_publish_report_to_tableau
+        #   description: "S4: Consolidate DQM output and publish to Tableau Cloud"
+        #   depends_on:
+        #     - task_key: s2_query_dataset_details
+        #   spark_python_task:
+        #     python_file: ./s4_publish_report_to_tableau.py
+        #   existing_cluster_id: 1023-021822-wqfpujup
+        #   libraries:
+        #     - pypi:
+        #         package: python-dotenv==1.1.1
+        #     - pypi:
+        #         package: tableauserverclient==0.38
+        #     - pypi:
+        #         package: tableauhyperapi
+        
+        # Stage 5: Generate Potential JIRA Tickets
+        - task_key: s5_generate_potential_jira_tickets
+          description: "S5: Generate potential adaptive rule JIRA tickets"
+          depends_on:
+            - task_key: s2_query_dataset_details
+          spark_python_task:
+            python_file: ./s5_generate_potential_jira_tickets.py
+          existing_cluster_id: 1023-021822-wqfpujup
+          libraries:
+            - pypi:
+                package: python-dotenv==1.1.1
+
+        # Stage 6:Log New JIRA Tickets
+        - task_key: s6_log_new_jira_tickets
+          description: "S6: Create new adaptive rule JIRA tickets"
+          depends_on:
+            - task_key: s5_generate_potential_jira_tickets
+          spark_python_task:
+            python_file: ./s6_log_new_jira_tickets.py
+          existing_cluster_id: 1023-021822-wqfpujup
+          libraries:
+            - pypi:
+                package: python-dotenv==1.1.1
+        
+        # Stage 7: Invalidate JIRA Tickets
+        - task_key: s7_invalidate_jira_tickets
+          description: "S7: Investigate and auto-invalidate stable adaptive rule breaks"
+          depends_on:
+            - task_key: s2_query_dataset_details
+            - task_key: s5_generate_potential_jira_tickets
+            - task_key: s6_log_new_jira_tickets
+          spark_python_task:
+            python_file: ./s7_invalidate_jira_tickets.py
+          existing_cluster_id: 1023-021822-wqfpujup
+          libraries:
+            - pypi:
+                package: python-dotenv==1.1.1
+
+        # Stage 8:Diagnose JIRA Issues
+        - task_key: s8_diagnose_jira_issues
+          description: "S8: Diagnose JGPV adaptive rule tickets by finding upstream JEJQ evidence"
+          depends_on:
+            - task_key: s6_log_new_jira_tickets
+          spark_python_task:
+            python_file: ./s8_diagnose_jira_issues.py
+          existing_cluster_id: 1023-021822-wqfpujup
+          libraries:
+            - pypi:
+                package: python-dotenv==1.1.1
+            - pypi:
+                package: strands-agents==1.47.0
+        
+        # Stage 9: Send Email Notifications
+        - task_key: s9_send_email_notification
+          description: "S9: Send email notifications for invalidated breaks and high-score adaptive alerts"
+          depends_on:
+            - task_key: s5_generate_potential_jira_tickets
+            - task_key: s7_invalidate_jira_tickets
+          spark_python_task:
+            python_file: ./s9_send_email_notification.py
+          existing_cluster_id: 1023-021822-wqfpujup
+          libraries:
+            - pypi:
+                package: python-dotenv==1.1.1
+
+  # # Optional: Separate job for reporting/visualization stages
+  # - name: dq_reporting_pipeline
+  #   description: "Separate pipeline for reporting stages (S3-S4)"
+    
+  #   tasks:
+  #     - task_key: s3_prepare_jjdmc_report
+  #       description: "S3: Prepare JJDMC enrichment report"
+  #       python_task:
+  #         python_file: ./s3_prepare_jjdmc_report.py
+  #       cluster:
+  #         spark_version: ${var.spark_version}
+  #         node_type_id: ${var.node_type}
+  #         num_workers: ${var.num_workers}
+  #       timeout_seconds: ${var.timeout_seconds}
+      
+  #     - task_key: s4_publish_report_to_tableau
+  #       description: "S4: Publish prepared reports to Tableau"
+  #       depends_on:
+  #         - task_key: s3_prepare_jjdmc_report
+  #       python_task:
+  #         python_file: ./s4_publish_report_to_tableau.py
+  #       cluster:
+  #         spark_version: ${var.spark_version}
+  #         node_type_id: ${var.node_type}
+  #         num_workers: ${var.num_workers}
+  #       timeout_seconds: ${var.timeout_seconds}
