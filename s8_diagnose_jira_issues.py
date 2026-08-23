@@ -30,7 +30,7 @@ External APIs Called
 - Jira REST API v2
     - POST /rest/api/2/search  – Search JEJQ issues (text ~ operator)
     - GET /rest/api/2/issue/{key}  – Fetch JEJQ issue details
-- LLM Gateway (ClaudeGatewayModel)
+- LLM Gateway (JNJClaudeGatewayModel)
     - POST /predict  – Generate root cause reasoning with evidence context
 
 Evidence Ranking Algorithm
@@ -70,7 +70,6 @@ LLM-Assisted Reasoning
 - Provides context: DQ symptoms, top JEJQ candidates with scores, ticket links
 - Generates suspected_root_cause reasoning
 - Produces expected_impact statement
-- Recommends next_actions for ticket resolution
 
 DQ Signal Extraction
 --------------------
@@ -104,7 +103,7 @@ Environment Variables
 Secrets (Databricks secret scope "collibra", or config.py fallback)
 --------------------------------------------------------------------
 - jira_url / jira_api_token / jira_ca_bundle
-- gateway_url / gateway_key  (Claude gateway for LLM)
+- jnj_gateway_url / jnj_gateway_key  (Claude gateway for LLM)
 - uc_catalog / uc_schema
 
 Signal Extraction Patterns
@@ -123,7 +122,7 @@ TO-DO
 2) Pull JGPV description and extract DQ signals (dataset, table, run_dt, row_count_direction).
 3) Query JEJQ evidence via search + graph augmentation.
 4) Score and rank JEJQ candidates deterministically.
-5) Use GenAI model to summarize top-ranked root causes (only if high confidence).
+5) Use JNJ model to summarize top-ranked root causes (only if high confidence).
 6) Enrich JGPV ticket description and add comment (high confidence only).
 """
 
@@ -135,6 +134,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+import pytz
 
 import pandas as pd
 import requests
@@ -142,8 +142,10 @@ import urllib3
 from pydantic import BaseModel, Field
 
 import config
-from strands_model import ClaudeGatewayModel
+from strands_model import JNJClaudeGatewayModel
 from pipeline_io import PipelineIO
+from strands.tools.mcp import ToolFilters
+from strands_agent import get_atlassian_mcp_client, build_agent
 
 try:
     from databricks.sdk import WorkspaceClient
@@ -159,10 +161,6 @@ logger = logging.getLogger(__name__)
 WRITE_MODE = os.getenv("PIPELINE_WRITE_MODE", "csv").strip().lower()
 LOCAL_OUTPUT_DIR = os.getenv("PIPELINE_LOCAL_OUTPUT_DIR", "./outputs")
 SECRET_SCOPE = os.getenv("DATABRICKS_SECRET_SCOPE", "collibra")
-
-if WRITE_MODE not in ("csv", "uc", "both"):
-    raise ValueError("PIPELINE_WRITE_MODE must be one of: csv, uc, both")
-
 
 def _load_secret_or_default(key: str, default: Any = None) -> Any:
     if dbutils is None:
@@ -254,11 +252,11 @@ SESSION.headers.update(
 
 
 class DiagnosisResult(BaseModel):
-    suspected_root_cause: str = Field(description="Most likely root cause summary")
+    suspected_root_cause: str = Field(description="Most likely root cause, under 800 characters")
     confidence: str = Field(description="High, Medium, or Low")
-    evidence_summary: List[str] = Field(description="Evidence bullets from upstream tickets")
+    evidence_summary: List[str] = Field(description="At most 4 bullets, each under 300 characters")
     suspected_upstream_tickets: List[str] = Field(description="Likely JEJQ ticket keys")
-    next_actions: List[str] = Field(description="Recommended next actions")
+    # next_actions: List[str] = Field(description="Recommended next actions")
 
 
 def jira_get_issue(issue_key: str, fields: str = "summary,description,status,updated") -> Dict[str, Any]:
@@ -824,6 +822,8 @@ def search_upstream_evidence(query_text: str, signals: Dict[str, Any]) -> List[D
     business_unit = signals.get("business_unit")
     run_dt = signals.get("run_dt")
     project = signals.get("project")
+    schedule_time = signals.get("scheduleTime") # 18:55:00
+    time_zone = signals.get("timeZone") # e.g. Asia/Singapore
 
     # Strategy 1: Primary search - table components + business unit + temporal window
     terms = []
@@ -858,11 +858,21 @@ def search_upstream_evidence(query_text: str, signals: Dict[str, Any]) -> List[D
     )
 
     start_dt = run_dt - timedelta(days=window_days)
+    if schedule_time and time_zone:
+        # add schedule_time (timezone dependent HH:MM:SS, usually Asia/Singapore) to 
+        # run_dt (UTC) to get the full datetime with time and timezone
+        schedule_hour, schedule_minute, schedule_second = map(int, schedule_time.split(":"))
+        local_tz = pytz.timezone(time_zone)
+        run_dt = run_dt.astimezone(local_tz)
+        end_dt = run_dt.replace(hour=schedule_hour, minute=schedule_minute, second=schedule_second)
+        end_dt = end_dt.astimezone(pytz.utc)
+    else:
+        end_dt = run_dt + timedelta(hours=S8_POST_RUN_GRACE_HOURS)
 
     jql1 = (
         f'project = JEJQ '
         f'AND updated >= "{start_dt.strftime("%Y-%m-%d %H:%M")}" '
-        # f'AND updated <= "{run_dt.strftime("%Y-%m-%d %H:%M")}"'
+        f'AND updated <= "{end_dt.strftime("%Y-%m-%d %H:%M")}"'
     )
 
     if term_clause:
@@ -980,6 +990,12 @@ def issue_to_text(issue: Dict[str, Any], include_comments: bool = True) -> str:
     updated = fields.get("updated") or ""
     created = fields.get("created") or ""
     issue_type = (fields.get("issuetype") or {}).get("name") if isinstance(fields.get("issuetype"), dict) else fields.get("issuetype")
+    components = fields.get("components") or []
+    component_names = ", ".join(
+        c.get("name", "")
+        for c in components
+        if isinstance(c, dict)
+    )
     description = fields.get("description") or ""
     comments = _extract_comment_text_with_sanitization(fields) if include_comments else ""
     dev_dt = _extract_dev_latest_dt(issue)
@@ -987,6 +1003,7 @@ def issue_to_text(issue: Dict[str, Any], include_comments: bool = True) -> str:
         f"Key: {key}\n"
         f"Type: {issue_type}\n"
         f"Summary: {summary}\n"
+        f"Components: {component_names}\n"
         f"Status: {status}\n"
         f"Created: {created}\n"
         f"Updated: {updated}\n"
@@ -999,6 +1016,82 @@ def issue_to_text(issue: Dict[str, Any], include_comments: bool = True) -> str:
     return base_text
 
 
+# def diagnose_with_agent(
+#     jgpv_key: str,
+#     jgpv_summary: str,
+#     jgpv_description: str,
+#     signals: Dict[str, Any],
+#     evidence_issues: List[Dict[str, Any]],
+# ) -> DiagnosisResult:
+#     """Generate structured root-cause diagnosis from ranked JEJQ evidence.
+
+#     This function converts top-ranked upstream evidence issues into a compact
+#     textual context, builds an instruction prompt, and asks the JNJ Claude
+#     gateway model to return a validated ``DiagnosisResult``.
+
+#     Prompt behavior enforced here:
+#     - Uses only the first 12 evidence issues to keep context bounded.
+#     - Requests a confidence label (High/Medium/Low), concise evidence bullets,
+#       likely upstream ticket keys, and concrete next actions.
+#     - Constrains ``suspected_upstream_tickets`` to keys present in the provided
+#       evidence context.
+#     - Adds a local/pixonomy routing constraint: unless the affected table is in
+#       pixonomy, local schema tickets should not be selected.
+#     - Adds a migration constraint: in-progress JEJQ migrations are unlikely to 
+#     cause DQ issues.
+
+#     Args:
+#         jgpv_key: Target adaptive-rule incident key being diagnosed.
+#         jgpv_summary: JGPV issue summary text.
+#         jgpv_description: Full JGPV issue description markup/text.
+#         signals: Parsed DQ signals (dataset, run_id, break keys, etc.) used to
+#             ground the prompt.
+#         evidence_issues: Ranked JEJQ candidate issues from deterministic search
+#             and scoring.
+
+#     Returns:
+#         A ``DiagnosisResult`` produced via structured output validation,
+#         containing suspected root cause, confidence, evidence bullets,
+#         suspected upstream ticket keys, and next actions.
+#     """
+#     evidence_text = "\n\n".join(
+#         issue_to_text(item, include_comments=(idx < 4))
+#         for idx, item in enumerate(evidence_issues[:12])
+#     )
+#     logger.info(f"[DEBUG] evidence_text length: {len(evidence_text)}")
+#     prompt = f"""
+# You are a data quality analyst diagnosing pipeline incidents.
+
+# Target incident ticket: {jgpv_key}
+# Summary: {jgpv_summary}
+# Description:\n{jgpv_description}
+
+# Extracted DQ signals:
+# - dataset: {signals.get('dataset')}
+# - run_id: {signals.get('run_id')}
+# - break_keys: {signals.get('break_keys')}
+
+# Candidate upstream evidence tickets:
+# {evidence_text}
+
+# Task:
+# 1) Infer suspected root cause(s) linking the DQ issue with upstream or system changes.
+# 2) Provide confidence level (High/Medium/Low).
+# 3) Provide concise evidence bullets referencing upstream ticket keys.
+# 4) suspected_upstream_tickets must contain only upstream ticket keys found in the evidence above.
+
+# Note that it's unlikely that the change of table in local schema (jp, na, kr, anz, cn) will affect the table in another local schema even if they share the same table name,
+# unless the affected table is in pixonomy schema. If the table is in pixonomy schema, its change may affect other local schemas if it's upstream.
+# Also note that in-progress migration of JEJQ task is unlikely to cause DQ issues.
+# """.strip()
+
+#     model = JNJClaudeGatewayModel(
+#         api_key=_load_secret_or_default("JNJ_GENAI_API_KEY", config.JNJ_GENAI_API_KEY),
+#         temperature=0.1,
+#         max_tokens=1500,
+#     )
+#     return model.structured_output(DiagnosisResult, prompt)
+
 def diagnose_with_agent(
     jgpv_key: str,
     jgpv_summary: str,
@@ -1006,37 +1099,8 @@ def diagnose_with_agent(
     signals: Dict[str, Any],
     evidence_issues: List[Dict[str, Any]],
 ) -> DiagnosisResult:
-    """Generate structured root-cause diagnosis from ranked JEJQ evidence.
-
-    This function converts top-ranked upstream evidence issues into a compact
-    textual context, builds an instruction prompt, and asks the Claude
-    gateway model to return a validated ``DiagnosisResult``.
-
-    Prompt behavior enforced here:
-    - Uses only the first 12 evidence issues to keep context bounded.
-    - Requests a confidence label (High/Medium/Low), concise evidence bullets,
-      likely upstream ticket keys, and concrete next actions.
-    - Constrains ``suspected_upstream_tickets`` to keys present in the provided
-      evidence context.
-    - Adds a CN/APAC routing constraint: unless the affected table is in
-      pixonomy, CN-region tickets should not be selected.
-
-    Args:
-        jgpv_key: Target adaptive-rule incident key being diagnosed.
-        jgpv_summary: JGPV issue summary text.
-        jgpv_description: Full JGPV issue description markup/text.
-        signals: Parsed DQ signals (dataset, run_id, break keys, etc.) used to
-            ground the prompt.
-        evidence_issues: Ranked JEJQ candidate issues from deterministic search
-            and scoring.
-
-    Returns:
-        A ``DiagnosisResult`` produced via structured output validation,
-        containing suspected root cause, confidence, evidence bullets,
-        suspected upstream ticket keys, and next actions.
-    """
     evidence_text = "\n\n".join(
-        issue_to_text(item, include_comments=(idx < 4))
+        issue_to_text(item, include_comments=(idx < 12))
         for idx, item in enumerate(evidence_issues[:12])
     )
     prompt = f"""
@@ -1048,6 +1112,8 @@ Description:\n{jgpv_description}
 
 Extracted DQ signals:
 - dataset: {signals.get('dataset')}
+- project: {signals.get('project')}
+- table_name: {signals.get('table_name')}
 - run_id: {signals.get('run_id')}
 - break_keys: {signals.get('break_keys')}
 
@@ -1057,25 +1123,65 @@ Candidate upstream evidence tickets:
 Task:
 1) Infer suspected root cause(s) linking the DQ issue with upstream or system changes.
 2) Provide confidence level (High/Medium/Low).
-3) Provide concise evidence bullets referencing upstream ticket keys.
-4) Provide actionable next steps.
+3) Provide at most 4 concise evidence bullets, each under 300 characters,
+   referencing upstream ticket keys.
+4) suspected_root_cause must be under 800 characters.
 5) suspected_upstream_tickets must contain only upstream ticket keys found in the evidence above.
 
-Note that CN region is separated from APAC, so unless the affected table is in pixonomy db, do not include CN region tickets in suspected_upstream_tickets. 
+If you are not sure, try to search and read the comments in JEJQ tickets to find the clues, do not assume.
+Note that it's unlikely that the change of table in local schema (jp, na, kr, anz, cn) will affect the table in another local schema even if they share the same table name,
+unless the affected DQ table is in pixonomy schema.
+Note that na schema contains kr.
+Also note that in-progress migration of JEJQ task is unlikely to cause DQ issues.
+Take note of component name of the ticket, ANGen-MAF is different from ANGen, if DQ project is ANGen, it is unlikely to be caused by ANGen-MAF JEJQ tickets, and vice versa.
+
 """.strip()
 
-    model = ClaudeGatewayModel(
-        api_key=_load_secret_or_default("GENAI_API_KEY", config.GENAI_API_KEY),
-        temperature=0.1,
-        max_tokens=1500,
+    logged_tool_ids = set()
+
+    def log_events(**event: Any) -> None:
+        tool_use = event.get("current_tool_use") or {}
+        # Tool input streams in incrementally; log once per toolUseId.
+        if tool_use.get("name") and tool_use.get("toolUseId") not in logged_tool_ids:
+            logged_tool_ids.add(tool_use.get("toolUseId"))
+            logger.info("[TOOL] %s input=%s", tool_use["name"], tool_use.get("input"))
+        if event.get("reasoningText"):
+            logger.info("[REASONING] %s", event["reasoningText"])
+
+    mcp_client = get_atlassian_mcp_client()
+    # Read-only, scoped to the two tools the reasoning step should ever need.
+    mcp_client._tool_filters = ToolFilters(allowed=['jira_get_agile_boards', 'jira_get_all_projects', 'jira_get_attachment_images', 'jira_get_board_issues', 'jira_get_issue', 'jira_get_link_types', 'jira_get_project_issues', 'jira_get_project_versions', 'jira_get_sprint_issues', 'jira_get_sprints_from_board', 'jira_get_transitions', 'jira_get_user_profile', 'jira_get_worklog', 'jira_search', 'jira_search_fields'])
+
+    agent = build_agent(
+        mcp_client,
+        model=JNJClaudeGatewayModel(
+            api_key=_load_secret_or_default("JNJ_GENAI_API_KEY", config.JNJ_GENAI_API_KEY),
+            temperature=0.1,
+            max_tokens=8192,
+        ),
+        system_prompt=(
+            "You are a data quality analyst diagnosing pipeline incidents. "
+            "Only use provided tools to verify/expand on tickets already provided."
+        ),
+        callback_handler=log_events,
     )
-    return model.structured_output(DiagnosisResult, prompt)
+    try:
+        result = agent(prompt, structured_output_model=DiagnosisResult, limits={"turns": 8})
+        # result.structured_output is the validated DiagnosisResult
+        logger.info("model turns=%s tokens=%s",
+            result.metrics.cycle_count,
+            result.metrics.accumulated_usage)
+
+        return result.structured_output
+
+    finally:
+        agent.cleanup()
 
 
 def build_enrichment_block(diagnosis: DiagnosisResult, generated_at: str) -> str:
     evidence_lines = "\n".join([f"- {line}" for line in diagnosis.evidence_summary]) or "- None"
     upstream_lines = "\n".join([f"- {key}" for key in diagnosis.suspected_upstream_tickets]) or "- None"
-    action_lines = "\n".join([f"- {line}" for line in diagnosis.next_actions]) or "- None"
+    # action_lines = "\n".join([f"- {line}" for line in diagnosis.next_actions]) or "- None"
 
     return (
         "h3. Investigation Summary (AI-assisted)\n\n"
@@ -1087,8 +1193,8 @@ def build_enrichment_block(diagnosis: DiagnosisResult, generated_at: str) -> str
         f"{upstream_lines}\n\n"
         "h4. Evidence Details\n\n"
         f"{evidence_lines}\n\n"
-        "h4. Proposed Next Actions\n\n"
-        f"{action_lines}\n"
+        # "h4. Proposed Next Actions\n\n"
+        # f"{action_lines}\n"
     )
 
 
@@ -1137,7 +1243,11 @@ def run() -> None:
 
     issue_keys = []
     if "SUBTASK" in df_adaptive.columns:
+        if "SUBTASK_STATUS" in df_adaptive.columns:
+            # only diagnose new or reopened subtasks to avoid re-diagnosing tickets with repeating issues
+            df_adaptive = df_adaptive[df_adaptive["SUBTASK_STATUS"].str.strip().str.lower().isin(["new", "reopened"])]
         issue_keys = df_adaptive["SUBTASK"].dropna().astype(str).str.strip().unique().tolist()
+
     if not issue_keys and "issue_key" in df_new.columns:
         issue_keys = df_adaptive["issue_key"].dropna().astype(str).str.strip().unique().tolist()
 
@@ -1158,9 +1268,12 @@ def run() -> None:
 
             signals = extract_dq_signals(description)
             # add dataset project mapping into signals
-            signals["project"] = df_bu[
-                df_bu["dataset"] == signals.get("dataset")
-                ]["Project"].values[0] if not df_bu[df_bu["dataset"] == signals.get("dataset")].empty else None
+            df_ds = df_bu[df_bu["dataset"] == signals.get("dataset")]
+            
+            signals["project"] = df_ds["Project"].values[0] if not df_ds.empty else None
+            signals["scheduleTime"] = df_ds["scheduleTime"].values[0] if not df_ds.empty else None
+            signals["timeZone"] = df_ds["timeZone"].values[0] if not df_ds.empty else None
+
             evidence = search_upstream_evidence(description, signals)
             logger.info(f"[DEBUG] search_upstream_evidence returned {len(evidence)} results")
             logger.info(f"[DEBUG] signals keys: {list(signals.keys())}")
@@ -1181,7 +1294,7 @@ def run() -> None:
             )
             try:
                 diagnosis = diagnose_with_agent(issue_key, summary, description, signals, evidence)
-                logger.info(f"[LLM_REASONING] {issue_key}: {diagnosis.suspected_root_cause[:300]}")
+                logger.info(f"[LLM_REASONING] {issue_key}: {diagnosis.suspected_root_cause}")
             except Exception as e:
                 import traceback
                 logger.error(f"LLM diagnose failed: {type(e).__name__}: {e}")
@@ -1212,11 +1325,13 @@ def run() -> None:
                     "issue_key": issue_key,
                     "dataset": signals.get("dataset"),
                     "run_id": signals.get("run_id"),
+                    "summary": summary,
+                    "description": description,
                     "confidence": diagnosis.confidence,
                     "suspected_root_cause": diagnosis.suspected_root_cause,
                     "suspected_upstream_tickets": ", ".join(diagnosis.suspected_upstream_tickets),
                     "evidence_count": len(diagnosis.evidence_summary),
-                    "next_actions": " | ".join(diagnosis.next_actions),
+                    # "next_actions": " | ".join(diagnosis.next_actions),
                     "status": "updated" if posted_to_jira else "skipped_non_high_confidence",
                 }
             )
@@ -1235,7 +1350,7 @@ def run() -> None:
                     "suspected_root_cause": None,
                     "suspected_upstream_tickets": None,
                     "evidence_count": 0,
-                    "next_actions": None,
+                    # "next_actions": None,
                     "status": f"error: {exc}",
                 }
             )
