@@ -15,6 +15,11 @@ try:
 except ImportError:
     pass
 
+# --- Databricks Configuration ---
+# Retrieve the Databricks host URL.
+DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST")
+# Retrieve the Databricks personal access token.
+DATABRICKS_TOKEN = os.environ.get("DATABRICKS_TOKEN")
 
 # --- PostgreSQL RDS Database Configuration ---
 # Retrieve the database host address from environment variables.
