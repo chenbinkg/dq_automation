@@ -1,0 +1,15 @@
+.DS_Store
+.github
+.databricks
+.vscode
+.env
+.env.dev
+.env.prod
+.venv
+.bak
+__pycache__
+*.pyc
+*data
+*outputs
+*.ipynb_checkpoints
+*python_debug_notebook.ipynb
