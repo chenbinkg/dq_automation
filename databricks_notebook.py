@@ -1,8 +1,13 @@
 import requests
 import os
+from dotenv import load_dotenv
 
-DATABRICKS_HOST = "https://dbc-1a2fed98-ca15.cloud.databricks.com" # your workspace URL
-DATABRICKS_TOKEN = "" # paste your PAT here — do NOT commit this to git
+# override=True forces os.environ to update with the newest .env values
+load_dotenv(dotenv_path=".env.dev", override=True) # Load environment variables for dev environment
+# load_dotenv(dotenv_path=".env.prod", override=True) # Load environment variables for prod environment
+
+DATABRICKS_HOST = os.getenv("DATABRICKS_HOST") # your workspace URL
+DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN") # your token
 
 if not DATABRICKS_TOKEN:
     raise ValueError("Set DATABRICKS_TOKEN before running this cell.")
@@ -33,12 +38,6 @@ else:
     )
     r.raise_for_status()
     print(f"Secret scope '{SCOPE}' created successfully.")
-
-import os
-from dotenv import load_dotenv
-
-# override=True forces os.environ to update with the newest .env values
-load_dotenv(override=True) 
 
 
 secrets = {
