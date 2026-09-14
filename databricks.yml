@@ -5,16 +5,6 @@
 bundle:
   name: dq_automation
 
-targets:
-  dev:
-    mode: development
-    workspace:
-      host: https://dbc-1a2fed98-ca15.cloud.databricks.com
-  prod:
-    mode: production
-    workspace:
-      host: https://dbc-1d2e2f8a-2140.cloud.databricks.com
-
 variables:
   spark_version:
     default: "14.3.x-scala2.12"
@@ -24,6 +14,25 @@ variables:
     default: 1
   timeout_seconds:
     default: 3600
+  cluster_id:
+    description: "Existing cluster ID for the Databricks cluster"
+    default: "1023-021822-wqfpujup"
+
+targets:
+  dev:
+    mode: development
+    workspace:
+      host: https://dbc-1a2fed98-ca15.cloud.databricks.com
+    variables:
+      cluster_id: 1023-021822-wqfpujup
+  prod:
+    mode: production
+    workspace:
+      host: https://dbc-1d2e2f8a-2140.cloud.databricks.com
+    variables:
+      cluster_id: 0128-064509-tf6od0jl
+
+
 
 resources:
   jobs:
@@ -47,7 +56,7 @@ resources:
           description: "S1: Fetch datasets and business unit mappings from Collibra CDQ API"
           spark_python_task:
             python_file: ./s1_query_dataset_and_bu.py
-          existing_cluster_id: 1023-021822-wqfpujup
+          existing_cluster_id: ${var.cluster_id}
           libraries:
             - pypi:
                 package: python-dotenv==1.1.1
@@ -59,7 +68,7 @@ resources:
             - task_key: s1_query_dataset_and_bu
           spark_python_task:
             python_file: ./s2_query_dataset_details.py
-          existing_cluster_id: 1023-021822-wqfpujup
+          existing_cluster_id: ${var.cluster_id}
           libraries:
             - pypi:
                 package: python-dotenv==1.1.1
@@ -71,7 +80,7 @@ resources:
             - task_key: s2_query_dataset_details
           spark_python_task:
             python_file: ./s3_prepare_jjdmc_report.py
-          existing_cluster_id: 1023-021822-wqfpujup
+          existing_cluster_id: ${var.cluster_id}
           libraries:
             - pypi:
                 package: python-dotenv==1.1.1
@@ -83,7 +92,7 @@ resources:
         #     - task_key: s2_query_dataset_details
         #   spark_python_task:
         #     python_file: ./s4_publish_report_to_tableau.py
-        #   existing_cluster_id: 1023-021822-wqfpujup
+        #   existing_cluster_id: ${var.cluster_id}
         #   libraries:
         #     - pypi:
         #         package: python-dotenv==1.1.1
@@ -99,7 +108,7 @@ resources:
             - task_key: s2_query_dataset_details
           spark_python_task:
             python_file: ./s5_generate_potential_jira_tickets.py
-          existing_cluster_id: 1023-021822-wqfpujup
+          existing_cluster_id: ${var.cluster_id}
           libraries:
             - pypi:
                 package: python-dotenv==1.1.1
@@ -111,7 +120,7 @@ resources:
             - task_key: s5_generate_potential_jira_tickets
           spark_python_task:
             python_file: ./s6_log_new_jira_tickets.py
-          existing_cluster_id: 1023-021822-wqfpujup
+          existing_cluster_id: ${var.cluster_id}
           libraries:
             - pypi:
                 package: python-dotenv==1.1.1
@@ -125,7 +134,7 @@ resources:
             - task_key: s6_log_new_jira_tickets
           spark_python_task:
             python_file: ./s7_invalidate_jira_tickets.py
-          existing_cluster_id: 1023-021822-wqfpujup
+          existing_cluster_id: ${var.cluster_id}
           libraries:
             - pypi:
                 package: python-dotenv==1.1.1
@@ -137,7 +146,7 @@ resources:
             - task_key: s6_log_new_jira_tickets
           spark_python_task:
             python_file: ./s8_diagnose_jira_issues.py
-          existing_cluster_id: 1023-021822-wqfpujup
+          existing_cluster_id: ${var.cluster_id}
           libraries:
             - pypi:
                 package: python-dotenv==1.1.1
@@ -152,7 +161,7 @@ resources:
             - task_key: s7_invalidate_jira_tickets
           spark_python_task:
             python_file: ./s9_send_email_notification.py
-          existing_cluster_id: 1023-021822-wqfpujup
+          existing_cluster_id: ${var.cluster_id}
           libraries:
             - pypi:
                 package: python-dotenv==1.1.1
