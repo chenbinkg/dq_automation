@@ -13,6 +13,35 @@ This repository orchestrates a 9-stage workflow that:
 - and optionally publishes outputs to Tableau.
 
 The pipeline is designed to run in Databricks (as a scheduled job bundle), while still supporting local execution for development and debugging.
+## Notes for Production
+
+### Secret Management
+Keep a local `.env` to save the environment variables.
+Or even better to keep `.env.dev` and `.env.prod` to differentiate the dev and prod environments (Recommended).
+Please refer to `.env.example`, all environment variables are saved to Databricks secret scope `collibra`.
+For first-time secret scope set-up, please change `dotenv_path` in the first cell of databricks_notebook.ipynb, and the run all cells for the notebook.
+
+### Pipeline Configuration
+The pipeline configuration can be found in databricks.yml, take note that thefollwing variables are configured with respect to dev and prod targets.
+- cluster_id
+- databricks host
+
+### Deployment
+To deploy the pipeline to production, ensure your databricks profile is set up locally and execute the following from command line:
+```bash
+export DATABRICKS_CONFIG_PROFILE=<profile-name>
+databricks bundle deploy -t prod
+```
+After deployment of the bundle, run the automation pipeline. 
+```bash
+databricks bundle run dq_automation_pipeline -t prod
+```
+
+### Database Migration
+Make sure to have DEV DB and PROD DB environmental variables configured in your .env file (refer to .env.example). Then run the python script postgres_dev_to_prod.py to migrate the contents from dev to prod
+```bash
+python postgre_io.py migrate-dev-to-prod
+```
 
 ## Table of Contents
 
