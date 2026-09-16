@@ -45,7 +45,7 @@ Outputs (written via PipelineIO.write_output)
 | dataset_adaptive_rule_details   | Adaptive (behaviour) rule items (transposed dqItems)         |
 | dqm_dashboard_by_data_domain    | Aggregated DQ scores joined with Data Domain / BU metadata   |
 | dataset_definitions             | Column-level DQ configuration: checks enabled, data types,   |
-|                                 | scheduler settings, date-filter key, current null %          |
+|                                 | scheduler settings, date-filter key, current null percent    |
 | dataset_custom_rules            | Custom rule definitions enriched with template values,       |
 |                                 | run-level metrics (score/perc/exception) and BU metadata     |
 | dataset_dupe_details             | Raw duplicate records for each dataset run                  |
@@ -60,7 +60,7 @@ Secrets (Databricks secret scope "collibra", or config.py fallback)
 --------------------------------------------------------------------
 - cdq_base_url_apac / cdq_base_url_cn
 - username_apac / password_apac / username_cn / password_cn
-- db_host / db_port / db_name / db_user / db_password / db_table  (PostgreSQL)
+- db_host / db_port / db_name / db_user / db_password / dqm_hist_db_table  (PostgreSQL)
 - uc_catalog / uc_schema  (Unity Catalog, required when PIPELINE_WRITE_MODE != csv)
 
 TO-DO
@@ -79,16 +79,11 @@ import numpy as np
 import requests
 import urllib3
 import config
-try:
-    import psycopg2
-    import psycopg2.extras as extras
-except ImportError:
-    psycopg2 = None  # postgres writes are optional; guarded by write_to_postgres()
-    extras = None
 from typing import Optional, Dict, Any, Tuple, List
 from requests.utils import quote
 from pipeline_io import PipelineIO
 from token_manager import CollibraTokenManager
+import postgres_io
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Logging
@@ -127,12 +122,11 @@ uc_catalog = _load_secret_or_default("uc_catalog", getattr(config, "UC_CATALOG",
 uc_schema = _load_secret_or_default("uc_schema", getattr(config, "UC_SCHEMA", None))
 
 # DB credentials (loaded separately so they fail independently of Collibra creds)
-db_host = _load_secret_or_default("db_host", config.DB_HOST)
-db_port = _load_secret_or_default("db_port", config.DB_PORT)
-db_name = _load_secret_or_default("db_name", config.DB_NAME)
-db_user = _load_secret_or_default("db_user", config.DB_USER)
-db_password = _load_secret_or_default("db_password", config.DB_PASSWORD)
-db_table = _load_secret_or_default("db_table", config.DB_TABLE)
+db_credentials = postgres_io.load_db_credentials(dbutils, SECRET_SCOPE, config)
+dqm_hist_db_table = _load_secret_or_default("dqm_hist_db_table", config.DQM_HIST_DB_TABLE)
+bu_mapping_db_table = _load_secret_or_default("bu_mapping_db_table", config.BU_MAPPING_DB_TABLE)
+dataset_def_db_table = _load_secret_or_default("dataset_def_db_table", config.DATASET_DEF_DB_TABLE)
+dataset_custom_rules_db_table = _load_secret_or_default("dataset_custom_rules_db_table", config.DATASET_CUSTOM_RULES_DB_TABLE)
 
 # Token managers
 token_mgr_apac = CollibraTokenManager(
@@ -184,89 +178,150 @@ def _to_bool(v):
 
 def write_to_postgres(df: pd.DataFrame) -> None:
     """
-    Deduplicate against existing rows in the DB and INSERT only new records.
-    Uses ON CONFLICT (dataset, runId) DO NOTHING as a safety net.
-    Skips gracefully when DB credentials are not configured.
+    Insert-only write of dqm_dashboard_by_data_domain into dqm_hist_db_table,
+    keyed on (dataset, runId). Uses ON CONFLICT DO NOTHING; existing rows are
+    left untouched.
     """
-    if psycopg2 is None:
-        logger.warning("psycopg2 not available — skipping PostgreSQL write")
+    settings = postgres_io.settings_for_table(db_credentials, dqm_hist_db_table)
+    if settings is None:
+        logger.warning("DB credentials/table not configured — skipping dqm_dashboard_by_data_domain DB write")
         return
-
-    if not all([db_host, db_name, db_user, db_password]):
-        logger.warning("DB credentials not configured — skipping PostgreSQL write")
-        return
-
     if df.empty:
         logger.info("dqm_dashboard_by_data_domain is empty — skipping DB write")
         return
 
-    def _make_conn():
-        return psycopg2.connect(
-            host=db_host,
-            port=db_port,
-            dbname=db_name,
-            user=db_user,
-            password=db_password,
-            sslmode="require",
-        )
-
-    # ---- 1) Dedup: fetch existing (dataset, runId) pairs ----
-    try:
-        with _make_conn() as conn:
-            df_hist = pd.read_sql(
-                f'SELECT "dataset","runId" FROM {db_table}', conn
-            )
-    except Exception as e:
-        logger.warning(f"Could not read history from DB ({e}) — will insert all rows")
-        df_hist = pd.DataFrame(columns=["dataset", "runId"])
-
-    df_new = df[
-        ~df.set_index(["dataset", "runId"]).index.isin(
-            df_hist.set_index(["dataset", "runId"]).index
-        )
-    ].copy()
-
-    logger.info(f"DB dedup: {len(df)} total, {len(df_new)} new rows to insert")
-    if df_new.empty:
-        logger.info("No new rows to insert — skipping DB write")
-        return
-
-    # ---- 2) Normalise columns for psycopg2 ----
-    if "runDate" in df_new.columns:
-        df_new["runDate"] = (
-            df_new["runDate"]
+    df = df.copy()
+    if "runDate" in df.columns:
+        df["runDate"] = (
+            df["runDate"]
             .astype(str)
             .str.replace(r"\+0000$", "+00:00", regex=True)
             .replace("NaT", None)
         )
+    if "jobSchedule" in df.columns:
+        df["jobSchedule"] = df["jobSchedule"].map(_to_bool)
 
-    if "jobSchedule" in df_new.columns:
-        df_new["jobSchedule"] = df_new["jobSchedule"].map(_to_bool)
-
-    # Enforce column order; fill missing cols with None
-    for col in DB_COLS:
-        if col not in df_new.columns:
-            df_new[col] = None
-    df_new = df_new[DB_COLS]
-
-    # ---- 3) Build INSERT SQL ----
-    quoted_cols = ",".join([f'"{c}"' for c in DB_COLS])
-    sql = f"""
-        INSERT INTO {db_table} ({quoted_cols})
-        VALUES %s
-        ON CONFLICT ("dataset","runId") DO NOTHING
-    """
-    rows = [tuple(r) for r in df_new.to_numpy()]
-    logger.info(f"Prepared {len(rows)} rows for insertion into {db_table}")
-
-    # ---- 4) Execute ----
     try:
-        with _make_conn() as conn:
-            with conn.cursor() as cur:
-                extras.execute_values(cur, sql, rows, page_size=500)
-        logger.info(f"Inserted {len(rows)} rows into {db_table}")
+        n = postgres_io.insert_on_conflict_do_nothing(
+            df, settings, insert_columns=DB_COLS, conflict_columns=["dataset", "runId"]
+        )
+        logger.info(f"Attempted insert of {n} rows into {dqm_hist_db_table}")
     except Exception as e:
-        logger.error(f"DB write failed: {e}")
+        logger.error(f"dqm_dashboard_by_data_domain DB write failed: {e}")
+        raise
+
+
+BU_MAPPING_COLS = [
+    "dataset", "business_unit", "Market", "Project", "CDE", "jobSchedule",
+    "Data Domain", "subDomain", "connectionName", "db_nm", "table_nm",
+    "scheduleTime", "timeZone",
+]
+
+def write_bu_mapping_to_postgres(df: pd.DataFrame) -> None:
+    """Upsert business_unit_mapping into dqm_business_unit_mapping, keyed on dataset."""
+    settings = postgres_io.settings_for_table(db_credentials, bu_mapping_db_table)
+    if settings is None:
+        logger.warning("DB credentials/table not configured — skipping business_unit_mapping DB write")
+        return
+    if df.empty:
+        logger.info("business_unit_mapping is empty — skipping DB write")
+        return
+
+    key_cols = ["dataset"]
+    change_cols = [c for c in BU_MAPPING_COLS if c not in key_cols]
+    try:
+        n = postgres_io.upsert_dataframe(
+            df, settings, key_columns=key_cols, all_columns=BU_MAPPING_COLS,
+            change_detect_columns=change_cols,
+        )
+        logger.info(f"Upserted {n} rows into {bu_mapping_db_table}")
+    except Exception as e:
+        logger.error(f"business_unit_mapping DB write failed: {e}")
+        raise
+
+
+DATASET_DEF_COLS = [
+    "dataset", "Run Id", "Link Id", "Date Filter", "Date Filter Key", "Scheduler",
+    "Scheduled Freq", "Scheduled Time", "col_name", "Data Type", "Row Count",
+    "Execution Time", "Data Type Check", "Schema Change", "Dupes", "Custom Rules",
+    "Null Values", "Empty Fields", "Uniqueness", "Min", "Max", "Mean", "Outliers",
+    "Shapes", "Patterns", "Current Null Pct", "db_nm", "table_nm",
+    "business_unit", "Market", "Project", "CDE",
+]
+
+def write_dataset_definitions_to_postgres(df: pd.DataFrame) -> None:
+    """
+    Upsert dataset_definitions into dqm_dataset_definitions, keyed on
+    (dataset, col_name). "Run Id" is always refreshed on every update; other
+    columns only trigger an update when their value actually changed.
+    Column rows dropped from a dataset's latest definition are deleted.
+    """
+    settings = postgres_io.settings_for_table(db_credentials, dataset_def_db_table)
+    if settings is None:
+        logger.warning("DB credentials/table not configured — skipping dataset_definitions DB write")
+        return
+    if df.empty:
+        logger.info("dataset_definitions is empty — skipping DB write")
+        return
+
+    df = df.dropna(subset=["col_name"]).copy()
+    if df.empty:
+        logger.info("dataset_definitions has no column-level rows — skipping DB write")
+        return
+
+    key_cols = ["dataset", "col_name"]
+    change_cols = [c for c in DATASET_DEF_COLS if c not in key_cols and c != "Run Id"]
+    try:
+        n = postgres_io.upsert_dataframe(
+            df, settings, key_columns=key_cols, all_columns=DATASET_DEF_COLS,
+            change_detect_columns=change_cols,
+        )
+        logger.info(f"Upserted {n} rows into {dataset_def_db_table}")
+
+        deleted = postgres_io.delete_rows_not_in_keys(
+            df, settings, group_columns=["dataset"], key_columns=key_cols
+        )
+        logger.info(f"Deleted {deleted} stale column rows from {dataset_def_db_table}")
+    except Exception as e:
+        logger.error(f"dataset_definitions DB write failed: {e}")
+        raise
+
+
+CUSTOM_RULES_COLS = [
+    "dataset", "runId", "ruleNm", "ruleType", "score", "perc", "exception",
+    "owlId", "breakMsg", "assignmentId", "dimId", "dimName", "stale",
+    "business_unit", "Market", "Project", "CDE", "jobSchedule", "Data Domain",
+    "subDomain", "connectionName", "db_nm", "table_nm", "scheduleTime", "timeZone",
+]
+
+def write_custom_rules_to_postgres(df: pd.DataFrame) -> None:
+    """
+    Insert-only write of dataset_custom_rules into dqm_dataset_custom_rule_details,
+    keyed on (dataset, ruleNm, runId). ruleValue is intentionally excluded — it has
+    no corresponding DB column. Existing rows are left untouched.
+    """
+    settings = postgres_io.settings_for_table(db_credentials, dataset_custom_rules_db_table)
+    if settings is None:
+        logger.warning("DB credentials/table not configured — skipping dataset_custom_rules DB write")
+        return
+    if df.empty:
+        logger.info("dataset_custom_rules is empty — skipping DB write")
+        return
+
+    df = df.copy()
+    if "assignmentId" in df.columns:
+        df["assignmentId"] = df["assignmentId"].apply(
+            lambda v: json.dumps(v) if isinstance(v, (list, dict)) else v
+        )
+
+    key_cols = ["dataset", "ruleNm", "runId"]
+    try:
+        n = postgres_io.insert_on_conflict_do_nothing(
+            df, settings, insert_columns=CUSTOM_RULES_COLS, conflict_columns=key_cols
+        )
+        logger.info(f"Attempted insert of {n} rows into {dataset_custom_rules_db_table}")
+    except Exception as e:
+        logger.error(f"dataset_custom_rules DB write failed: {e}")
         raise
 
 def get_job_findings(
@@ -613,25 +668,25 @@ def collect_included_columns_from_section(section: Any) -> set:
     if isinstance(section, dict):
         include = section.get("include") or section.get("columns")
         if isinstance(include, list):
-            cols.update([str(c).lower() for c in include if c])
+            cols.update([str(c) for c in include if c])
         settings = section.get("settings") or section.get("items")
         if isinstance(settings, list):
             for s in settings:
                 inc = s.get("include") or s.get("columns")
                 if isinstance(inc, list):
-                    cols.update([str(c).lower() for c in inc if c])
+                    cols.update([str(c) for c in inc if c])
                 col = s.get("column")
                 if isinstance(col, str):
-                    cols.add(col.lower())
+                    cols.add(col)
     elif isinstance(section, list):
         for item in section:
             if isinstance(item, dict):
                 inc = item.get("include") or item.get("columns")
                 if isinstance(inc, list):
-                    cols.update([str(c).lower() for c in inc if c])
+                    cols.update([str(c) for c in inc if c])
                 col = item.get("column")
                 if isinstance(col, str):
-                    cols.add(col.lower())
+                    cols.add(col)
     return cols
 
 def collect_excluded_columns_from_section(section: Any) -> set:
@@ -640,25 +695,25 @@ def collect_excluded_columns_from_section(section: Any) -> set:
     if isinstance(section, dict):
         exclude = section.get("exclude") or section.get("columns")
         if isinstance(exclude, list):
-            cols.update([str(c).lower() for c in exclude if c])
+            cols.update([str(c) for c in exclude if c])
         settings = section.get("settings") or section.get("items")
         if isinstance(settings, list):
             for s in settings:
                 exclude = s.get("exclude") or s.get("columns")
                 if isinstance(exclude, list):
-                    cols.update([str(c).lower() for c in exclude if c])
+                    cols.update([str(c) for c in exclude if c])
                 col = s.get("column")
                 if isinstance(col, str):
-                    cols.add(col.lower())
+                    cols.add(col)
     elif isinstance(section, list):
         for item in section:
             if isinstance(item, dict):
                 exclude = item.get("exclude") or item.get("columns")
                 if isinstance(exclude, list):
-                    cols.update([str(c).lower() for c in exclude if c])
+                    cols.update([str(c) for c in exclude if c])
                 col = item.get("column")
                 if isinstance(col, str):
-                    cols.add(col.lower())
+                    cols.add(col)
     return cols
 
 def collect_patterns_map(section: Any) -> Dict[str, List[str]]:
@@ -678,7 +733,7 @@ def collect_patterns_map(section: Any) -> Dict[str, List[str]]:
         include = it.get("include") or it.get("columns") or []
         if isinstance(include, list) and key:
             for c in include:
-                cl = str(c).lower()
+                cl = str(c)
                 out.setdefault(cl, []).append(str(key))
     return out
 
@@ -1036,10 +1091,10 @@ for index, row in df_input.iterrows():
                 if not isinstance(cn, str):
                     continue
                 cn_l = cn.lower()
-                data_types[cn_l] = cs.get("type")
-                col_descs[cn_l] = cs.get("description") or cs.get("comment") or ""
+                data_types[cn] = cs.get("type")
+                col_descs[cn] = cs.get("description") or cs.get("comment") or ""
                 if _is_truthy(cs.get("enabled", True)):
-                    shape_enabled_cols.add(cn_l)
+                    shape_enabled_cols.add(cn)
 
         # Identify columns from SQL or shape
         cols_from_sql = parse_select_columns(query) if isinstance(query, str) else None
@@ -1066,17 +1121,17 @@ for index, row in df_input.iterrows():
         if not all_columns:
             # Dataset-level record (no columns)
             rec = {
-                "Table Name": dataset,
-                "Rule Id": run_id,
+                "dataset": dataset,
+                "Run Id": run_id,
                 "Link Id": link_id,
                 "Date Filter": bool(date_filter_enabled),
                 "Date Filter Key": date_filter_key,
                 "Scheduler": bool(scheduler_enabled),
                 "Scheduled Freq": sched_freq,
                 "Scheduled Time": sched_time,
-                "Column Name": None,
+                "col_name": None,
                 "Data Type": None,
-                "Column Description": None,
+                # "Column Description": None,
                 "Row Count": bool(row_count),
                 "Execution Time": bool(exec_time),
                 "Data Type Check": bool(dtype_check),
@@ -1092,29 +1147,29 @@ for index, row in df_input.iterrows():
                 "Outliers": bool(outliers_on or len(outlier_cols) > 0),
                 "Shapes": bool(len(shape_enabled_cols) > 0),
                 "Patterns": None,
-                "Current Null %": None,
+                "Current Null Pct": None,
             }
             def_records.append(rec)
         else:
             for col in all_columns:
-                col_l = str(col).lower()
+                # col_l = str(col).lower()
                 rec = {
-                    "Table Name": dataset,
-                    "Rule Id": run_id,
+                    "dataset": dataset,
+                    "Run Id": run_id,
                     "Link Id": link_id,
                     "Date Filter": bool(date_filter_enabled),
                     "Date Filter Key": date_filter_key,
                     "Scheduler": bool(scheduler_enabled),
                     "Scheduled Freq": sched_freq,
                     "Scheduled Time": sched_time,
-                    "Column Name": col_l,
-                    "Data Type": data_types.get(col_l),
-                    "Column Description": col_descs.get(col_l),
+                    "col_name": col,
+                    "Data Type": data_types.get(col),
+                    # "Column Description": col_descs.get(col),
                     "Row Count": bool(row_count),
                     "Execution Time": bool(exec_time),
                     "Data Type Check": bool(dtype_check),
                     "Schema Change": bool(schema_change),
-                    "Dupes": bool(col_l in dupe_cols or (dupe_on and not dupe_cols)),
+                    "Dupes": bool(col in dupe_cols or (dupe_on and not dupe_cols)),
                     "Custom Rules": bool(rule_on),
                     "Null Values": bool(null_check),
                     "Empty Fields": bool(empty_check),
@@ -1122,10 +1177,10 @@ for index, row in df_input.iterrows():
                     "Min": bool(min_check),
                     "Max": bool(max_check),
                     "Mean": bool(mean_check),
-                    "Outliers": bool(col_l in outlier_cols or (outliers_on and not outlier_cols)),
-                    "Shapes": bool(col_l in shape_enabled_cols or (not shape_enabled_cols and col_l in data_types)),
-                    "Patterns": ";".join(patterns_map.get(col_l, [])) if col_l in patterns_map else None,
-                    "Current Null %": None,
+                    "Outliers": bool(col in outlier_cols or (outliers_on and not outlier_cols)),
+                    "Shapes": bool(col in shape_enabled_cols or (not shape_enabled_cols and col in data_types)),
+                    "Patterns": ";".join(patterns_map.get(col, [])) if col in patterns_map else None,
+                    "Current Null Pct": None,
                 }
                 def_records.append(rec)
     else:
@@ -1143,27 +1198,27 @@ for index, row in df_input.iterrows():
                       get_nested(it, "runProfile.colName"))
                 if not isinstance(col, str) or not col.strip():
                     continue
-                col_l = col.strip().lower()
+                # col_l = col.strip().lower()
 
                 null_ratio = _extract_null_ratio(it)
                 null_pct = (null_ratio * 100.0) if isinstance(null_ratio, (int, float)) else None
 
                 delta_records.append({
-                    "Table Name": dataset,
-                    "Rule Id": run_id,
-                    "Column Name": col_l,
-                    "Current Null %": null_pct,
+                    "dataset": dataset,
+                    "Run Id": run_id,
+                    "col_name": col,
+                    "Current Null Pct": null_pct,
                 })
         elif d_status is not None:
             logger.debug(f"Profile deltas fetch failed for '{dataset}': status={d_status}, err={d_err}")
 
 # Build DataFrame
 cols_def = [
-    "Table Name", "Rule Id", "Link Id", "Date Filter", "Date Filter Key", "Scheduler", 
-    "Scheduled Freq", "Scheduled Time", "Column Name", "Data Type", "Column Description",
+    "dataset", "Run Id", "Link Id", "Date Filter", "Date Filter Key", "Scheduler", 
+    "Scheduled Freq", "Scheduled Time", "col_name", "Data Type", 
     "Row Count", "Execution Time", "Data Type Check", "Schema Change", "Dupes", "Custom Rules",
     "Null Values", "Empty Fields", "Uniqueness", "Min", "Max", "Mean", "Outliers", "Shapes", 
-    "Patterns", "Current Null %"
+    "Patterns", "Current Null Pct"
 ]
 
 df_dataset_definitions = pd.DataFrame(def_records) if def_records else pd.DataFrame(columns=cols_def)
@@ -1174,19 +1229,19 @@ df_dataset_definitions = df_dataset_definitions[cols_def]
 
 # Build and merge deltas
 df_deltas = pd.DataFrame(delta_records) if delta_records else pd.DataFrame(
-    columns=["Table Name", "Rule Id", "Column Name", "Current Null %"]
+    columns=["dataset", "Run Id", "col_name", "Current Null Pct"]
 )
 
 if not df_deltas.empty:
-    df_deltas["Table Name"] = df_deltas["Table Name"].astype(str)
-    df_deltas["Rule Id"] = df_deltas["Rule Id"].astype(str)
-    df_deltas["Column Name"] = df_deltas["Column Name"].astype(str).str.lower()
+    df_deltas["dataset"] = df_deltas["dataset"].astype(str)
+    df_deltas["Run Id"] = df_deltas["Run Id"].astype(str)
+    df_deltas["col_name"] = df_deltas["col_name"].astype(str)
 
     df_dataset_definitions = pd.merge(
         df_dataset_definitions,
-        df_deltas[["Table Name", "Rule Id", "Column Name", "Current Null %"]],
+        df_deltas[["dataset", "Run Id", "col_name", "Current Null Pct"]],
         how="left",
-        on=["Table Name", "Rule Id", "Column Name"]
+        on=["dataset", "Run Id", "col_name"]
     )
 
     # Ensure no duplicate columns after merge
@@ -1200,20 +1255,20 @@ logger.info(f"Built dataset_definitions with {len(df_dataset_definitions)} recor
 
 # Merge with business_unit_mapping (only columns that exist at this point)
 if not df_dataset_definitions.empty and not df_bu.empty and "dataset" in df_bu.columns:
-    bu_df = df_bu.rename(columns={"dataset": "Table Name"})
+    # bu_df = df_bu.rename(columns={"dataset": "dataset"})
     
     # Only select columns that actually exist in df_bu at this point
     # db_nm and table_nm will be added later after df_custom_rules is built
-    cols_to_merge = ["Table Name"]
+    cols_to_merge = ["dataset"]
     for col in ["db_nm", "table_nm", "business_unit", "Market", "Project", "CDE"]:
-        if col in bu_df.columns:
+        if col in df_bu.columns:
             cols_to_merge.append(col)
     
     df_dataset_definitions = pd.merge(
         df_dataset_definitions,
-        bu_df[cols_to_merge],
+        df_bu[cols_to_merge],
         how="left",
-        on="Table Name"
+        on="dataset"
     )
     logger.info(f"Enriched dataset_definitions with business_unit_mapping")
 
@@ -1465,6 +1520,15 @@ write_output(df_patterns, "dataset_pattern_details")
 # Write dqm_dashboard_by_data_domain to PostgreSQL database
 logger.info("Writing dqm_dashboard_by_data_domain to PostgreSQL...")
 write_to_postgres(dqm_dashboard_by_data_domain_df)
+
+logger.info("Writing business_unit_mapping to PostgreSQL...")
+write_bu_mapping_to_postgres(df_bu)
+
+logger.info("Writing dataset_definitions to PostgreSQL...")
+write_dataset_definitions_to_postgres(df_dataset_definitions)
+
+logger.info("Writing dataset_custom_rules to PostgreSQL...")
+write_custom_rules_to_postgres(df_dataset_custom_rules)
 
 logger.info("\n" + "=" * 60)
 logger.info("S2 Pipeline completed successfully!")
