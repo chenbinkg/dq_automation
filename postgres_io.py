@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS public.dqm_dashboard_global_position (
 CREATE_DQM_BUSINESS_UNIT_MAPPING_SQL = """
 CREATE TABLE IF NOT EXISTS public.dqm_business_unit_mapping (
     "dataset" varchar(255) PRIMARY KEY,
+    "region" varchar(100),
     "business_unit" varchar(100),
     "Market" varchar(20),
     "Project" varchar(100),
@@ -108,6 +109,7 @@ CREATE TABLE IF NOT EXISTS public.dqm_business_unit_mapping (
 CREATE_DQM_DATASET_DEFINITIONS_SQL = """
 CREATE TABLE IF NOT EXISTS public.dqm_dataset_definitions (
     "dataset" varchar(255) NOT NULL,
+    "region" varchar(100),
     "Run Id" timestamptz,
     "Link Id" text,
     "Date Filter" boolean,
