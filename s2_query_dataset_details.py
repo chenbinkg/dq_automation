@@ -212,7 +212,7 @@ def write_to_postgres(df: pd.DataFrame) -> None:
 
 
 BU_MAPPING_COLS = [
-    "dataset", "business_unit", "Market", "Project", "CDE", "jobSchedule",
+    "dataset", "region", "business_unit", "Market", "Project", "CDE", "jobSchedule",
     "Data Domain", "subDomain", "connectionName", "db_nm", "table_nm",
     "scheduleTime", "timeZone",
 ]
@@ -241,7 +241,7 @@ def write_bu_mapping_to_postgres(df: pd.DataFrame) -> None:
 
 
 DATASET_DEF_COLS = [
-    "dataset", "Run Id", "Link Id", "Date Filter", "Date Filter Key", "Scheduler",
+    "dataset", "region", "Run Id", "Link Id", "Date Filter", "Date Filter Key", "Scheduler",
     "Scheduled Freq", "Scheduled Time", "col_name", "Data Type", "Row Count",
     "Execution Time", "Data Type Check", "Schema Change", "Dupes", "Custom Rules",
     "Null Values", "Empty Fields", "Uniqueness", "Min", "Max", "Mean", "Outliers",
@@ -1260,7 +1260,7 @@ if not df_dataset_definitions.empty and not df_bu.empty and "dataset" in df_bu.c
     # Only select columns that actually exist in df_bu at this point
     # db_nm and table_nm will be added later after df_custom_rules is built
     cols_to_merge = ["dataset"]
-    for col in ["db_nm", "table_nm", "business_unit", "Market", "Project", "CDE"]:
+    for col in ["region", "db_nm", "table_nm", "business_unit", "Market", "Project", "CDE"]:
         if col in df_bu.columns:
             cols_to_merge.append(col)
     
