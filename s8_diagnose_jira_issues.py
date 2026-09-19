@@ -142,7 +142,7 @@ import urllib3
 from pydantic import BaseModel, Field
 
 import config
-from strands_model import JNJClaudeGatewayModel
+from jnj_strands_model import JNJClaudeGatewayModel
 from pipeline_io import PipelineIO
 from strands.tools.mcp import ToolFilters
 from strands_agent import get_atlassian_mcp_client, build_agent
@@ -1016,82 +1016,6 @@ def issue_to_text(issue: Dict[str, Any], include_comments: bool = True) -> str:
     return base_text
 
 
-# def diagnose_with_agent(
-#     jgpv_key: str,
-#     jgpv_summary: str,
-#     jgpv_description: str,
-#     signals: Dict[str, Any],
-#     evidence_issues: List[Dict[str, Any]],
-# ) -> DiagnosisResult:
-#     """Generate structured root-cause diagnosis from ranked JEJQ evidence.
-
-#     This function converts top-ranked upstream evidence issues into a compact
-#     textual context, builds an instruction prompt, and asks the JNJ Claude
-#     gateway model to return a validated ``DiagnosisResult``.
-
-#     Prompt behavior enforced here:
-#     - Uses only the first 12 evidence issues to keep context bounded.
-#     - Requests a confidence label (High/Medium/Low), concise evidence bullets,
-#       likely upstream ticket keys, and concrete next actions.
-#     - Constrains ``suspected_upstream_tickets`` to keys present in the provided
-#       evidence context.
-#     - Adds a local/pixonomy routing constraint: unless the affected table is in
-#       pixonomy, local schema tickets should not be selected.
-#     - Adds a migration constraint: in-progress JEJQ migrations are unlikely to 
-#     cause DQ issues.
-
-#     Args:
-#         jgpv_key: Target adaptive-rule incident key being diagnosed.
-#         jgpv_summary: JGPV issue summary text.
-#         jgpv_description: Full JGPV issue description markup/text.
-#         signals: Parsed DQ signals (dataset, run_id, break keys, etc.) used to
-#             ground the prompt.
-#         evidence_issues: Ranked JEJQ candidate issues from deterministic search
-#             and scoring.
-
-#     Returns:
-#         A ``DiagnosisResult`` produced via structured output validation,
-#         containing suspected root cause, confidence, evidence bullets,
-#         suspected upstream ticket keys, and next actions.
-#     """
-#     evidence_text = "\n\n".join(
-#         issue_to_text(item, include_comments=(idx < 4))
-#         for idx, item in enumerate(evidence_issues[:12])
-#     )
-#     logger.info(f"[DEBUG] evidence_text length: {len(evidence_text)}")
-#     prompt = f"""
-# You are a data quality analyst diagnosing pipeline incidents.
-
-# Target incident ticket: {jgpv_key}
-# Summary: {jgpv_summary}
-# Description:\n{jgpv_description}
-
-# Extracted DQ signals:
-# - dataset: {signals.get('dataset')}
-# - run_id: {signals.get('run_id')}
-# - break_keys: {signals.get('break_keys')}
-
-# Candidate upstream evidence tickets:
-# {evidence_text}
-
-# Task:
-# 1) Infer suspected root cause(s) linking the DQ issue with upstream or system changes.
-# 2) Provide confidence level (High/Medium/Low).
-# 3) Provide concise evidence bullets referencing upstream ticket keys.
-# 4) suspected_upstream_tickets must contain only upstream ticket keys found in the evidence above.
-
-# Note that it's unlikely that the change of table in local schema (jp, na, kr, anz, cn) will affect the table in another local schema even if they share the same table name,
-# unless the affected table is in pixonomy schema. If the table is in pixonomy schema, its change may affect other local schemas if it's upstream.
-# Also note that in-progress migration of JEJQ task is unlikely to cause DQ issues.
-# """.strip()
-
-#     model = JNJClaudeGatewayModel(
-#         api_key=_load_secret_or_default("JNJ_GENAI_API_KEY", config.JNJ_GENAI_API_KEY),
-#         temperature=0.1,
-#         max_tokens=1500,
-#     )
-#     return model.structured_output(DiagnosisResult, prompt)
-
 def diagnose_with_agent(
     jgpv_key: str,
     jgpv_summary: str,
@@ -1099,10 +1023,42 @@ def diagnose_with_agent(
     signals: Dict[str, Any],
     evidence_issues: List[Dict[str, Any]],
 ) -> DiagnosisResult:
+    """Generate structured root-cause diagnosis from ranked JEJQ evidence.
+
+    This function converts top-ranked upstream evidence issues into a compact
+    textual context, builds an instruction prompt, and asks the JNJ Claude
+    gateway model to return a validated ``DiagnosisResult``.
+
+    Prompt behavior enforced here:
+    - Uses only the first 12 evidence issues to keep context bounded.
+    - Requests a confidence label (High/Medium/Low), concise evidence bullets,
+      likely upstream ticket keys, and concrete next actions.
+    - Constrains ``suspected_upstream_tickets`` to keys present in the provided
+      evidence context.
+    - Adds a local/pixonomy routing constraint: unless the affected table is in
+      pixonomy, local schema tickets should not be selected.
+    - Adds a migration constraint: in-progress JEJQ migrations are unlikely to 
+    cause DQ issues.
+
+    Args:
+        jgpv_key: Target adaptive-rule incident key being diagnosed.
+        jgpv_summary: JGPV issue summary text.
+        jgpv_description: Full JGPV issue description markup/text.
+        signals: Parsed DQ signals (dataset, run_id, break keys, etc.) used to
+            ground the prompt.
+        evidence_issues: Ranked JEJQ candidate issues from deterministic search
+            and scoring.
+
+    Returns:
+        A ``DiagnosisResult`` produced via structured output validation,
+        containing suspected root cause, confidence, evidence bullets,
+        suspected upstream ticket keys, and next actions.
+    """
     evidence_text = "\n\n".join(
         issue_to_text(item, include_comments=(idx < 12))
         for idx, item in enumerate(evidence_issues[:12])
     )
+    logger.info(f"[DEBUG] evidence_text length: {len(evidence_text)}")
     prompt = f"""
 You are a data quality analyst diagnosing pipeline incidents.
 
@@ -1112,8 +1068,6 @@ Description:\n{jgpv_description}
 
 Extracted DQ signals:
 - dataset: {signals.get('dataset')}
-- project: {signals.get('project')}
-- table_name: {signals.get('table_name')}
 - run_id: {signals.get('run_id')}
 - break_keys: {signals.get('break_keys')}
 
@@ -1123,59 +1077,106 @@ Candidate upstream evidence tickets:
 Task:
 1) Infer suspected root cause(s) linking the DQ issue with upstream or system changes.
 2) Provide confidence level (High/Medium/Low).
-3) Provide at most 4 concise evidence bullets, each under 300 characters,
-   referencing upstream ticket keys.
-4) suspected_root_cause must be under 800 characters.
-5) suspected_upstream_tickets must contain only upstream ticket keys found in the evidence above.
+3) Provide concise evidence bullets referencing upstream ticket keys.
+4) suspected_upstream_tickets must contain only upstream ticket keys found in the evidence above.
 
-If you are not sure, try to search and read the comments in JEJQ tickets to find the clues, do not assume.
 Note that it's unlikely that the change of table in local schema (jp, na, kr, anz, cn) will affect the table in another local schema even if they share the same table name,
-unless the affected DQ table is in pixonomy schema.
-Note that na schema contains kr.
+unless the affected table is in pixonomy schema. If the table is in pixonomy schema, its change may affect other local schemas if it's upstream.
 Also note that in-progress migration of JEJQ task is unlikely to cause DQ issues.
 Take note of component name of the ticket, ANGen-MAF is different from ANGen, if DQ project is ANGen, it is unlikely to be caused by ANGen-MAF JEJQ tickets, and vice versa.
-
 """.strip()
 
-    logged_tool_ids = set()
-
-    def log_events(**event: Any) -> None:
-        tool_use = event.get("current_tool_use") or {}
-        # Tool input streams in incrementally; log once per toolUseId.
-        if tool_use.get("name") and tool_use.get("toolUseId") not in logged_tool_ids:
-            logged_tool_ids.add(tool_use.get("toolUseId"))
-            logger.info("[TOOL] %s input=%s", tool_use["name"], tool_use.get("input"))
-        if event.get("reasoningText"):
-            logger.info("[REASONING] %s", event["reasoningText"])
-
-    mcp_client = get_atlassian_mcp_client()
-    # Read-only, scoped to the two tools the reasoning step should ever need.
-    mcp_client._tool_filters = ToolFilters(allowed=['jira_get_agile_boards', 'jira_get_all_projects', 'jira_get_attachment_images', 'jira_get_board_issues', 'jira_get_issue', 'jira_get_link_types', 'jira_get_project_issues', 'jira_get_project_versions', 'jira_get_sprint_issues', 'jira_get_sprints_from_board', 'jira_get_transitions', 'jira_get_user_profile', 'jira_get_worklog', 'jira_search', 'jira_search_fields'])
-
-    agent = build_agent(
-        mcp_client,
-        model=JNJClaudeGatewayModel(
-            api_key=_load_secret_or_default("JNJ_GENAI_API_KEY", config.JNJ_GENAI_API_KEY),
-            temperature=0.1,
-            max_tokens=8192,
-        ),
-        system_prompt=(
-            "You are a data quality analyst diagnosing pipeline incidents. "
-            "Only use provided tools to verify/expand on tickets already provided."
-        ),
-        callback_handler=log_events,
+    model = JNJClaudeGatewayModel(
+        api_key=_load_secret_or_default("JNJ_GENAI_API_KEY", config.JNJ_GENAI_API_KEY),
+        temperature=0.1,
+        max_tokens=8192,
     )
-    try:
-        result = agent(prompt, structured_output_model=DiagnosisResult, limits={"turns": 8})
-        # result.structured_output is the validated DiagnosisResult
-        logger.info("model turns=%s tokens=%s",
-            result.metrics.cycle_count,
-            result.metrics.accumulated_usage)
+    return model.structured_output(DiagnosisResult, prompt)
 
-        return result.structured_output
+# def diagnose_with_agent(
+#     jgpv_key: str,
+#     jgpv_summary: str,
+#     jgpv_description: str,
+#     signals: Dict[str, Any],
+#     evidence_issues: List[Dict[str, Any]],
+# ) -> DiagnosisResult:
+#     evidence_text = "\n\n".join(
+#         issue_to_text(item, include_comments=(idx < 12))
+#         for idx, item in enumerate(evidence_issues[:12])
+#     )
+#     prompt = f"""
+# You are a data quality analyst diagnosing pipeline incidents.
 
-    finally:
-        agent.cleanup()
+# Target incident ticket: {jgpv_key}
+# Summary: {jgpv_summary}
+# Description:\n{jgpv_description}
+
+# Extracted DQ signals:
+# - dataset: {signals.get('dataset')}
+# - project: {signals.get('project')}
+# - table_name: {signals.get('table_name')}
+# - run_id: {signals.get('run_id')}
+# - break_keys: {signals.get('break_keys')}
+
+# Candidate upstream evidence tickets:
+# {evidence_text}
+
+# Task:
+# 1) Infer suspected root cause(s) linking the DQ issue with upstream or system changes.
+# 2) Provide confidence level (High/Medium/Low).
+# 3) Provide at most 4 concise evidence bullets, each under 300 characters,
+#    referencing upstream ticket keys.
+# 4) suspected_root_cause must be under 800 characters.
+# 5) suspected_upstream_tickets must contain only upstream ticket keys found in the evidence above.
+
+# If you are not sure, try to search and read the comments in JEJQ tickets to find the clues, do not assume.
+# Note that it's unlikely that the change of table in local schema (jp, na, kr, anz, cn) will affect the table in another local schema even if they share the same table name,
+# unless the affected DQ table is in pixonomy schema.
+# Note that na schema contains kr.
+# Also note that in-progress migration of JEJQ task is unlikely to cause DQ issues.
+# Take note of component name of the ticket, ANGen-MAF is different from ANGen, if DQ project is ANGen, it is unlikely to be caused by ANGen-MAF JEJQ tickets, and vice versa.
+
+# """.strip()
+
+#     logged_tool_ids = set()
+
+#     def log_events(**event: Any) -> None:
+#         tool_use = event.get("current_tool_use") or {}
+#         # Tool input streams in incrementally; log once per toolUseId.
+#         if tool_use.get("name") and tool_use.get("toolUseId") not in logged_tool_ids:
+#             logged_tool_ids.add(tool_use.get("toolUseId"))
+#             logger.info("[TOOL] %s input=%s", tool_use["name"], tool_use.get("input"))
+#         if event.get("reasoningText"):
+#             logger.info("[REASONING] %s", event["reasoningText"])
+
+#     mcp_client = get_atlassian_mcp_client()
+#     # Read-only, scoped to the two tools the reasoning step should ever need.
+#     mcp_client._tool_filters = ToolFilters(allowed=['jira_get_agile_boards', 'jira_get_all_projects', 'jira_get_attachment_images', 'jira_get_board_issues', 'jira_get_issue', 'jira_get_link_types', 'jira_get_project_issues', 'jira_get_project_versions', 'jira_get_sprint_issues', 'jira_get_sprints_from_board', 'jira_get_transitions', 'jira_get_user_profile', 'jira_get_worklog', 'jira_search', 'jira_search_fields'])
+
+#     agent = build_agent(
+#         mcp_client,
+#         model=JNJClaudeGatewayModel(
+#             api_key=_load_secret_or_default("JNJ_GENAI_API_KEY", config.JNJ_GENAI_API_KEY),
+#             temperature=0.1,
+#             max_tokens=8192,
+#         ),
+#         system_prompt=(
+#             "You are a data quality analyst diagnosing pipeline incidents. "
+#             "Only use provided tools to verify/expand on tickets already provided."
+#         ),
+#         callback_handler=log_events,
+#     )
+#     try:
+#         result = agent(prompt, structured_output_model=DiagnosisResult, limits={"turns": 8})
+#         # result.structured_output is the validated DiagnosisResult
+#         logger.info("model turns=%s tokens=%s",
+#             result.metrics.cycle_count,
+#             result.metrics.accumulated_usage)
+
+#         return result.structured_output
+
+#     finally:
+#         agent.cleanup()
 
 
 def build_enrichment_block(diagnosis: DiagnosisResult, generated_at: str) -> str:
