@@ -291,12 +291,14 @@ for config_item in region_configs:
         .reset_index()
         .rename(columns={"index": "dataset"})
     )
+    df_output['region'] = region
     df_output[["Market", "Project", "CDE"]] = df_output["business_unit"].apply(extract_business_unit_fields)
     df_lst.append(df_output)
     
     # Export dataset list
     df_ds = pd.DataFrame(ds_raw, columns=['dataset'])
     df_ds = df_ds[df_ds['dataset'].str.startswith('ds_')]  # remove testing datasets
+    df_ds['region'] = region
 
     # ---------------------------------------------------
     # 4) Fetch run_id for each dataset
