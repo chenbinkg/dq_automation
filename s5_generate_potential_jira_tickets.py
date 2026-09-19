@@ -115,7 +115,7 @@ except Exception:
 from mwaa_dataset_reference import MWAADatasetReference
 from pipeline_io import PipelineIO
 from token_manager import CollibraTokenManager
-from postgres_io import build_settings, read_sql
+from postgres_io import load_db_credentials, read_sql, settings_for_table
 import config
 
 
@@ -158,13 +158,9 @@ uc_catalog = _load_secret_or_default("uc_catalog", getattr(config, "UC_CATALOG",
 uc_schema = _load_secret_or_default("uc_schema", getattr(config, "UC_SCHEMA", None))
 
 
-postgres_settings = build_settings(
-    host=_load_secret_or_default("db_host", config.DB_HOST),
-    port=_load_secret_or_default("db_port", config.DB_PORT),
-    dbname=_load_secret_or_default("db_name", config.DB_NAME),
-    user=_load_secret_or_default("db_user", config.DB_USER),
-    password=_load_secret_or_default("db_password", config.DB_PASSWORD),
-    table=_load_secret_or_default("db_table", config.DB_TABLE),
+postgres_settings = settings_for_table(
+    load_db_credentials(dbutils, SECRET_SCOPE, config),
+    _load_secret_or_default("dqm_hist_db_table", config.DQM_HIST_DB_TABLE),
 )
 
 def parse_project_keys(raw: Any) -> List[str]:
