@@ -7,7 +7,7 @@ Reads intermediate outputs produced by S1 (dataset_runid, business_unit_mapping,
 and dataset_cn) and calls the Collibra CDQ REST API to retrieve detailed DQ run
 findings, dataset definitions, column profiles, custom rules, and outlier data
 for every dataset/runId pair.  Results are written back to the configured
-output store (CSV, Unity Catalog, or both) for consumption by downstream stages.
+output store (CSV, PostgreSQL, or both) for consumption by downstream stages.
 
 Inputs (read via PipelineIO.read_input)
 ----------------------------------------
@@ -53,15 +53,14 @@ Outputs (written via PipelineIO.write_output)
 
 Environment Variables
 ---------------------
-- PIPELINE_WRITE_MODE            : csv | uc | both  (default: csv)
+- PIPELINE_WRITE_MODE            : csv | postgres | both  (default: csv)
 - PIPELINE_LOCAL_OUTPUT_DIR      : path for CSV outputs  (default: ./outputs)
 
 Secrets (Databricks secret scope "collibra", or config.py fallback)
 --------------------------------------------------------------------
 - cdq_base_url_apac / cdq_base_url_cn
 - username_apac / password_apac / username_cn / password_cn
-- db_host / db_port / db_name / db_user / db_password / dqm_hist_db_table  (PostgreSQL)
-- uc_catalog / uc_schema  (Unity Catalog, required when PIPELINE_WRITE_MODE != csv)
+- db_host / db_port / db_name / db_user / db_password and PostgreSQL table names
 
 TO-DO
 -----
@@ -118,13 +117,10 @@ username_apac = _load_secret_or_default("username_apac", config.COLLIBRA_USERNAM
 password_apac = _load_secret_or_default("password_apac", config.COLLIBRA_PASSWORD_APAC)
 username_cn = _load_secret_or_default("username_cn", config.COLLIBRA_USERNAME_CN)
 password_cn = _load_secret_or_default("password_cn", config.COLLIBRA_PASSWORD_CN)
-uc_catalog = _load_secret_or_default("uc_catalog", getattr(config, "UC_CATALOG", None))
-uc_schema = _load_secret_or_default("uc_schema", getattr(config, "UC_SCHEMA", None))
 
 # DB credentials (loaded separately so they fail independently of Collibra creds)
 db_credentials = postgres_io.load_db_credentials(dbutils, SECRET_SCOPE, config)
 dqm_hist_db_table = _load_secret_or_default("dqm_hist_db_table", config.DQM_HIST_DB_TABLE)
-bu_mapping_db_table = _load_secret_or_default("bu_mapping_db_table", config.BU_MAPPING_DB_TABLE)
 dataset_def_db_table = _load_secret_or_default("dataset_def_db_table", config.DATASET_DEF_DB_TABLE)
 dataset_custom_rules_db_table = _load_secret_or_default("dataset_custom_rules_db_table", config.DATASET_CUSTOM_RULES_DB_TABLE)
 
@@ -141,9 +137,8 @@ pipeline_io = PipelineIO(
     local_output_dir=LOCAL_OUTPUT_DIR,
     dbutils=dbutils,
     spark=globals().get("spark"),
+    config_module=config,
     secret_scope=SECRET_SCOPE,
-    uc_catalog=uc_catalog,
-    uc_schema=uc_schema,
     logger=logger,
 )
 
@@ -208,35 +203,6 @@ def write_to_postgres(df: pd.DataFrame) -> None:
         logger.info(f"Attempted insert of {n} rows into {dqm_hist_db_table}")
     except Exception as e:
         logger.error(f"dqm_dashboard_by_data_domain DB write failed: {e}")
-        raise
-
-
-BU_MAPPING_COLS = [
-    "dataset", "region", "business_unit", "Market", "Project", "CDE", "jobSchedule",
-    "Data Domain", "subDomain", "connectionName", "db_nm", "table_nm",
-    "scheduleTime", "timeZone",
-]
-
-def write_bu_mapping_to_postgres(df: pd.DataFrame) -> None:
-    """Upsert business_unit_mapping into dqm_business_unit_mapping, keyed on dataset."""
-    settings = postgres_io.settings_for_table(db_credentials, bu_mapping_db_table)
-    if settings is None:
-        logger.warning("DB credentials/table not configured — skipping business_unit_mapping DB write")
-        return
-    if df.empty:
-        logger.info("business_unit_mapping is empty — skipping DB write")
-        return
-
-    key_cols = ["dataset"]
-    change_cols = [c for c in BU_MAPPING_COLS if c not in key_cols]
-    try:
-        n = postgres_io.upsert_dataframe(
-            df, settings, key_columns=key_cols, all_columns=BU_MAPPING_COLS,
-            change_detect_columns=change_cols,
-        )
-        logger.info(f"Upserted {n} rows into {bu_mapping_db_table}")
-    except Exception as e:
-        logger.error(f"business_unit_mapping DB write failed: {e}")
         raise
 
 
@@ -1520,9 +1486,6 @@ write_output(df_patterns, "dataset_pattern_details")
 # Write dqm_dashboard_by_data_domain to PostgreSQL database
 logger.info("Writing dqm_dashboard_by_data_domain to PostgreSQL...")
 write_to_postgres(dqm_dashboard_by_data_domain_df)
-
-logger.info("Writing business_unit_mapping to PostgreSQL...")
-write_bu_mapping_to_postgres(df_bu)
 
 logger.info("Writing dataset_definitions to PostgreSQL...")
 write_dataset_definitions_to_postgres(df_dataset_definitions)
