@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-S3: Prepare Quarterly JJDMC Report Artifacts (Optional)
+S3:  Prepare Quarterly JJDMC Report Artifacts (Optional)
 ========================================================
 
 Generates quarterly JJDMC (Janssen Joint Data Management Committee) reports by
@@ -19,12 +19,11 @@ Outputs (written via PipelineIO.write_output)
 ----------------------------------------------
 | Table name              | Description                                              |
 |-------------------------|----------------------------------------------------------|
-| epic_list_prepared      | Aggregated metrics by Epic / business unit / data domain |
 | IM_APAC_Customer        | Domain-specific report: Customer data (APAC region)      |
 | IM_APAC_Employee        | Domain-specific report: Employee data (APAC region)      |
 | IM_APAC_HCP             | Domain-specific report: HCP data (APAC region)           |
 | IM_APAC_Material        | Domain-specific report: Material data (APAC region)      |
-| mwaa_dq_trigger_datasets| Reference list of datasets that trigger MWAA workflows   |
+| dataset_custom_rules    | Dataset-level custom rule scores exploded by 4 domains   |
 
 Processing Logic
 ----------------
@@ -35,22 +34,20 @@ Processing Logic
    - Compute aggregated metrics (average, count) per rule
 3. Generate domain-specific outputs by filtering on data domain tags
 4. Include "Number of Records" column for each aggregated combination
-5. Write outputs to configured store (CSV, Unity Catalog, or both)
+5. Write outputs to configured store (CSV, PostgreSQL, or both)
 
 Environment Variables
 ---------------------
-- PIPELINE_WRITE_MODE        : csv | uc | both  (default: csv)
+- PIPELINE_WRITE_MODE        : csv | postgres | both  (default: csv)
 - PIPELINE_LOCAL_OUTPUT_DIR  : path for CSV outputs  (default: ./outputs)
 
 Secrets (Databricks secret scope "collibra", or config.py fallback)
 --------------------------------------------------------------------
-- db_host / db_port / db_name / db_user / db_password / db_table  (PostgreSQL)
-- uc_catalog / uc_schema  (required when PIPELINE_WRITE_MODE != csv)
+- db_host / db_port / db_name / db_user / db_password
 
 External Dependencies
 ---------------------
-- PostgreSQL: Reads historical DQ run data
-- Unity Catalog: Writes outputs when configured
+- PostgreSQL: Reads historical DQ data and writes full-refresh handoff snapshots
 """
 
 import os
@@ -112,8 +109,6 @@ username_apac = _load_secret_or_default("username_apac", config.COLLIBRA_USERNAM
 password_apac = _load_secret_or_default("password_apac", config.COLLIBRA_PASSWORD_APAC)
 username_cn = _load_secret_or_default("username_cn", config.COLLIBRA_USERNAME_CN)
 password_cn = _load_secret_or_default("password_cn", config.COLLIBRA_PASSWORD_CN)
-uc_catalog = _load_secret_or_default("uc_catalog", getattr(config, "UC_CATALOG", None))
-uc_schema = _load_secret_or_default("uc_schema", getattr(config, "UC_SCHEMA", None))
 
 
 # ---------------------------------------------------
@@ -142,11 +137,12 @@ pipeline_io = PipelineIO(
     local_output_dir=LOCAL_OUTPUT_DIR,
     dbutils=dbutils,
     spark=globals().get("spark"),
+    config_module=config,
     secret_scope=SECRET_SCOPE,
-    uc_catalog=uc_catalog,
-    uc_schema=uc_schema,
+    postgres_table_overrides={
+        "dataset_custom_rules": "public.dqm_auto_jjdmc_dataset_custom_rules",
+    },
     logger=logger,
-    sanitize_uc_table_names=True,
 )
 
 read_input = pipeline_io.read_input
@@ -391,7 +387,6 @@ system_mapping = {
     's3_conn_kr_raw': 'iDiscover Data Lake (S3 + Blob)',
     'Conn_Synapse_Prod': 'iDiscover DWH (Redshift + Synapse DB)',
     'Conn_Synapse_Prod_PD': 'iDiscover DWH (Redshift + Synapse DB)'
-
 }
 
 
