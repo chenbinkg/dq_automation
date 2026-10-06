@@ -66,7 +66,7 @@ Each email includes:
 
 Environment Variables
 ---------------------
-- PIPELINE_WRITE_MODE        : csv | uc | both  (default: csv)
+- PIPELINE_WRITE_MODE        : csv | postgres | both  (default: csv)
 - PIPELINE_LOCAL_OUTPUT_DIR  : path for CSV outputs  (default: ./outputs)
 
 Secrets (Databricks secret scope "collibra", or config.py fallback)
@@ -78,7 +78,7 @@ Secrets (Databricks secret scope "collibra", or config.py fallback)
 - jira_url / jira_api_token / jira_ca_bundle  (JIRA for recipient lookup)
 - jira_verify_ssl  (SSL verification flag)
 - cdq_base_url_apac  (CDQ dataset profile links)
-- uc_catalog / uc_schema
+- db_host / db_port / db_name / db_user / db_password
 
 Configuration Parameters
 ------------------------
@@ -168,9 +168,6 @@ def parse_bool(value: Any, default: bool = False) -> bool:
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-uc_catalog = _load_secret_or_default("uc_catalog", getattr(config, "UC_CATALOG", None))
-uc_schema = _load_secret_or_default("uc_schema", getattr(config, "UC_SCHEMA", None))
-
 pipeline_io = PipelineIO(
     write_mode=WRITE_MODE,
     local_output_dir=LOCAL_OUTPUT_DIR,
@@ -178,10 +175,7 @@ pipeline_io = PipelineIO(
     spark=globals().get("spark"),
     config_module=config,
     secret_scope=SECRET_SCOPE,
-    uc_catalog=uc_catalog,
-    uc_schema=uc_schema,
     logger=logger,
-    sanitize_uc_table_names=True,
 )
 read_input = pipeline_io.read_input
 
