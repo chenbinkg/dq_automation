@@ -76,7 +76,7 @@ Configuration Parameters
 
 Environment Variables
 ---------------------
-- PIPELINE_WRITE_MODE        : csv | uc | both  (default: csv)
+- PIPELINE_WRITE_MODE        : csv | postgres | both  (default: csv)
 - PIPELINE_LOCAL_OUTPUT_DIR  : path for CSV outputs  (default: ./outputs)
 
 Secrets (Databricks secret scope "collibra", or config.py fallback)
@@ -84,8 +84,8 @@ Secrets (Databricks secret scope "collibra", or config.py fallback)
 - cdq_base_url_apac / cdq_base_url_cn
 - username_apac / password_apac / username_cn / password_cn
 - jira_url / jira_api_token / jira_ca_bundle
-- db_host / db_port / db_name / db_user / db_password / db_table
-- uc_catalog / uc_schema
+- db_host / db_port / db_name / db_user / db_password / dqm_hist_db_table
+- db_host / db_port / db_name / db_user / db_password
 
 Auto-Invalidation Criteria
 --------------------------
@@ -112,7 +112,7 @@ import urllib3
 
 import config
 from pipeline_io import PipelineIO
-from postgres_io import build_settings, read_sql
+from postgres_io import load_db_credentials, read_sql, settings_for_table
 from token_manager import CollibraTokenManager
 
 try:
@@ -148,9 +148,6 @@ def parse_bool(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-uc_catalog = _load_secret_or_default("uc_catalog", getattr(config, "UC_CATALOG", None))
-uc_schema = _load_secret_or_default("uc_schema", getattr(config, "UC_SCHEMA", None))
-
 pipeline_io = PipelineIO(
     write_mode=WRITE_MODE,
     local_output_dir=LOCAL_OUTPUT_DIR,
@@ -158,10 +155,7 @@ pipeline_io = PipelineIO(
     spark=globals().get("spark"),
     config_module=config,
     secret_scope=SECRET_SCOPE,
-    uc_catalog=uc_catalog,
-    uc_schema=uc_schema,
     logger=logger,
-    sanitize_uc_table_names=True,
 )
 read_input = pipeline_io.read_input
 write_output = pipeline_io.write_output
@@ -178,13 +172,9 @@ cdq_password = _load_secret_or_default("password_apac", config.CDQ_PASSWORD_APAC
 cdq_verify_ssl_raw = _load_secret_or_default("cdq_verify_ssl", config.CDQ_VERIFY_SSL)
 cdq_ca_bundle = _load_secret_or_default("cdq_ca_bundle", config.CDQ_CA_BUNDLE)
 
-postgres_settings = build_settings(
-    host=_load_secret_or_default("db_host", config.DB_HOST),
-    port=_load_secret_or_default("db_port", config.DB_PORT),
-    dbname=_load_secret_or_default("db_name", config.DB_NAME),
-    user=_load_secret_or_default("db_user", config.DB_USER),
-    password=_load_secret_or_default("db_password", config.DB_PASSWORD),
-    table=_load_secret_or_default("db_table", config.DB_TABLE),
+postgres_settings = settings_for_table(
+    load_db_credentials(dbutils, SECRET_SCOPE, config),
+    _load_secret_or_default("dqm_hist_db_table", config.DQM_HIST_DB_TABLE),
 )
 
 if not raw_jira_url or not jira_token:
