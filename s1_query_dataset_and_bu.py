@@ -43,14 +43,14 @@ Notes
 
 Environment Variables
 ---------------------
-- PIPELINE_WRITE_MODE        : csv | uc | both  (default: csv)
+- PIPELINE_WRITE_MODE        : csv | postgres | both  (default: csv)
 - PIPELINE_LOCAL_OUTPUT_DIR  : path for CSV outputs  (default: ./outputs)
 
 Secrets (Databricks secret scope "collibra", or config.py fallback)
 --------------------------------------------------------------------
 - cdq_base_url_apac / cdq_base_url_cn
 - username_apac / password_apac / username_cn / password_cn
-- uc_catalog / uc_schema  (required when PIPELINE_WRITE_MODE != csv)
+- db_host / db_port / db_name / db_user / db_password
 """
 
 import requests
@@ -95,8 +95,6 @@ username_apac = _load_secret_or_default("username_apac", config.COLLIBRA_USERNAM
 password_apac = _load_secret_or_default("password_apac", config.COLLIBRA_PASSWORD_APAC)
 username_cn = _load_secret_or_default("username_cn", config.COLLIBRA_USERNAME_CN)
 password_cn = _load_secret_or_default("password_cn", config.COLLIBRA_PASSWORD_CN)
-uc_catalog = _load_secret_or_default("uc_catalog", getattr(config, "UC_CATALOG", None))
-uc_schema = _load_secret_or_default("uc_schema", getattr(config, "UC_SCHEMA", None))
 
 # ---------------------------------------------------
 # Initialize Token Managers
@@ -135,9 +133,8 @@ pipeline_io = PipelineIO(
     local_output_dir=LOCAL_OUTPUT_DIR,
     dbutils=dbutils,
     spark=globals().get("spark"),
+    config_module=config,
     secret_scope=SECRET_SCOPE,
-    uc_catalog=uc_catalog,
-    uc_schema=uc_schema,
 )
 
 read_input = pipeline_io.read_input
