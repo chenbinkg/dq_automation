@@ -13,13 +13,42 @@ This repository orchestrates a 9-stage workflow that:
 - and optionally publishes outputs to Tableau.
 
 The pipeline is designed to run in Databricks (as a scheduled job bundle), while still supporting local execution for development and debugging.
-## Notes for Production
+
+## Notes for Deployment and Production
 
 ### Secret Management
 Keep a local `.env` to save the environment variables.
 Or even better to keep `.env.dev` and `.env.prod` to differentiate the dev and prod environments (Recommended).
 Please refer to `.env.example`, all environment variables are saved to Databricks secret scope `collibra`.
 For first-time secret scope set-up, please change `dotenv_path` in the first cell of databricks_notebook.ipynb, and the run all cells for the notebook.
+You can use command line to manage the secrets which are stored in the secret scope `collibra`.
+To check existing secret scopes, you can run:
+```bash
+databricks secrets list-scopes -t dev # for dev
+# or
+databricks secrets list-scopes -t prod # for prod
+```
+To create secret scope, you can run:
+```bash
+databricks secrets create-scope collibra -t <target> # replace <target> with dev or prod
+```
+To list all existing secrets in the secret scope, you can run:
+```bash
+databricks secrets list-secrets collibra -t <target>
+```
+To update/add a secret, you can use following format:
+```bash
+databricks secrets put-secret <scope> <secret-key> --string-value <new-secret-value> -t <target>
+# for example
+databricks secrets put-secret collibra cdq_base_url_cn --string-value "https://jnj-cn-comm-dq.myxjp.com" -t dev
+```
+To add a new secret, you need to update the python scripts and .env file first, then use above method to add the secret, or you update `databricks_notebook.ipynb` and run the notebook which uses API to update the secret instead.
+To check a secret value, you can run:
+```bash
+databricks secrets get-secret <scope> <secret-key> -t <target> | jq -r .value | base64 --decode
+# for example
+databricks secrets get-secret collibra cdq_base_url_cn -t dev | jq -r .value | base64 --decode
+```
 
 ### Pipeline Configuration
 The pipeline configuration can be found in databricks.yml, take note that thefollwing variables are configured with respect to dev and prod targets.
@@ -27,12 +56,34 @@ The pipeline configuration can be found in databricks.yml, take note that thefol
 - databricks host
 
 ### Deployment
-To deploy the pipeline to production, ensure your databricks profile is set up locally and execute the following from command line:
+To deploy the pipeline to `dev` environment, set up a profile for `Service Principal`.
 ```bash
-export DATABRICKS_CONFIG_PROFILE=<profile-name>
+databricks configure --profile QA_SERVICE_PRINCIPAL
+```
+Edit .databrickscfg configuration file by:
+```bash
+vim ~/.databrickscfg
+```
+Then change the host and client_secret below and paste them into config file .databrickscfg:
+```bash
+[QA_SERVICE_PRINCIPAL]
+host       = https://dbc-1a2fed98-ca15.cloud.databricks.com
+client_id  = 9c060639-2782-4d7f-9606-841dfa9f85c3
+client_secret = <your-sp-client-secret>
+```
+Save the .databrickscfg file by pressing Shift+":", following by typing "wq!"
+After that, deploy to dev by running:
+```bash
+export DATABRICKS_CONFIG_PROFILE=QA_SERVICE_PRINCIPAL
+databricks bundle deploy -t dev
+```
+
+To deploy the pipeline to `production`, create a prod profile `PROD_SERVICE_PRINCIPAL` using the same method above, and execute the following from command line:
+```bash
+export DATABRICKS_CONFIG_PROFILE=PROD_SERVICE_PRINCIPAL
 databricks bundle deploy -t prod
 ```
-After deployment of the bundle, run the automation pipeline. 
+After deployment of the bundle, run the automation pipeline manually or wait for the schedule job to run at scheduled time.
 ```bash
 databricks bundle run dq_automation_pipeline -t prod
 ```
@@ -40,8 +91,10 @@ databricks bundle run dq_automation_pipeline -t prod
 ### Database Migration
 Make sure to have DEV DB and PROD DB environmental variables configured in your .env file (refer to .env.example). Then run the python script postgres_dev_to_prod.py to migrate the contents from dev to prod
 ```bash
-python postgre_io.py migrate-dev-to-prod
+python postgres_io.py migrate-dev-to-prod
+python postgres_dev_to_prod.py migrate-dev-to-prod
 ```
+
 
 ## Table of Contents
 
@@ -64,6 +117,7 @@ flowchart TD
     S1[S1 Query Datasets and BU]
     S2[S2 Query Dataset Details]
     S3[S3 Prepare JJDMC Report]
+    S4[S4 Publish to Tableau (Optional)]
     S5[S5 Generate Potential JIRA Tickets]
     S6[S6 Create/Reopen JIRA Tickets]
     S7[S7 Invalidate Adaptive Breaks]
@@ -110,9 +164,9 @@ Primary integration surfaces:
 ### Shared modules
 
 - `config.py`: environment-driven configuration source.
-- `pipeline_io.py`: unified CSV/Unity Catalog read-write abstraction.
+- `pipeline_io.py`: unified CSV/PostgreSQL read-write abstraction.
 - `token_manager.py`: Collibra token caching and refresh.
-- `postgres_io.py`: reusable PostgreSQL helpers.
+- `postgres_io.py`: reusable PostgreSQL helpers (shared credential loading, insert-only writes, change-aware upserts, stale-row pruning).
 - `tableau_publisher.py`: Hyper extract + Tableau publish helpers.
 - `jnj_strands_model.py`: J&J gateway model wrapper used in S8.
 - `mwaa_dataset_reference.py`: dataset inclusion/exclusion reference list.
@@ -180,6 +234,13 @@ Main outputs:
 - `dataset_pattern_details`
 - `dataset_definitions`
 - `dqm_dashboard_by_data_domain`
+
+S2 also syncs four tables to PostgreSQL (guarded to skip when DB credentials are incomplete):
+
+- `dqm_dashboard_by_data_domain` -> `dqm_hist_db_table`: insert-only, keyed on `(dataset, runId)`
+- `business_unit_mapping` -> `bu_mapping_db_table`: upsert keyed on `dataset`, updates only when a column value changed
+- `dataset_definitions` -> `dataset_def_db_table`: upsert keyed on `(dataset, col_name)`; `Run Id` always refreshes on update, other columns only update when changed, and column rows no longer present for a dataset are deleted
+- `dataset_custom_rules` -> `dataset_custom_rules_db_table`: insert-only, keyed on `(dataset, ruleNm, runId)`; `ruleValue` is excluded (no corresponding DB column)
 
 ## S3 - Prepare quarterly JJDMC report artifacts (optional)
 
@@ -287,7 +348,7 @@ Primary effect:
 Outputs are written through a shared I/O layer and can target:
 
 - CSV files under `./outputs`
-- Unity Catalog tables
+- PostgreSQL tables under `public.dqm_auto_<output_name>`
 - both (dual-write)
 
 Mode is controlled by `PIPELINE_WRITE_MODE`.
@@ -313,7 +374,7 @@ All scripts use `config.py` as the local source of truth and attempt Databricks 
 
 ## Core runtime settings
 
-- `PIPELINE_WRITE_MODE`: `csv`, `uc`, or `both`
+- `PIPELINE_WRITE_MODE`: `csv`, `postgres`, or `both`
 - `PIPELINE_LOCAL_OUTPUT_DIR`: local output path (default `./outputs`)
 - `DATABRICKS_SECRET_SCOPE`: secret scope name (default `collibra`)
 
@@ -344,12 +405,16 @@ All scripts use `config.py` as the local source of truth and attempt Databricks 
 - `DB_NAME`
 - `DB_USER`
 - `DB_PASSWORD`
-- `DB_TABLE`
+- `DQM_HIST_DB_TABLE`
+- `BU_MAPPING_DB_TABLE`
+- `DATASET_DEF_DB_TABLE`
+- `DATASET_CUSTOM_RULES_DB_TABLE`
 
-## Unity Catalog (when using `uc` or `both`)
+Connection credentials (`db_host`/`db_port`/`db_name`/`db_user`/`db_password`) are loaded once per script via `postgres_io.load_db_credentials()`, then combined with a table name through `postgres_io.settings_for_table()` for each write.
 
-- `UC_CATALOG`
-- `UC_SCHEMA`
+Pipeline handoff snapshots use transactional full refreshes. `business_unit_mapping` uses the existing `public.dqm_business_unit_mapping` upsert table, while the existing historical dashboard, dataset-definition, and custom-rule tables retain their specialized write policies.
+
+S3 writes its report-shaped custom-rule output to `public.dqm_auto_jjdmc_dataset_custom_rules`, leaving `public.dqm_auto_dataset_custom_rules` as the current-run S2-to-S5 handoff.
 
 ## Tableau Cloud (S4)
 
@@ -470,6 +535,63 @@ databricks bundle run dq_automation_pipeline -t dev
 
 By default, `databricks.yml` schedules the job daily in `Asia/Singapore` time.
 
+## Jenkins CI/CD
+
+The root `Jenkinsfile` is intended for a Jenkins multibranch pipeline. The Jenkins agent must provide:
+
+- Python 3 with `venv`
+- Databricks CLI with Asset Bundle support
+- Network access to the target Databricks workspace and package repository
+
+Create these Jenkins Username/Password credentials:
+
+| Jenkins credential ID | Username | Password |
+|---|---|---|
+| `dq-automation-databricks-dev` | Dev service-principal application/client ID | Dev OAuth client secret |
+| `dq-automation-databricks-prod` | Prod service-principal application/client ID | Prod OAuth client secret |
+
+The credentials are exposed to the Databricks CLI as `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET`; they must never be stored in the repository. Configure the Bitbucket checkout credential on the Jenkins multibranch job itself.
+
+Pipeline behavior:
+
+| Branch | Python checks | Databricks validation | Deployment | Job run |
+|---|---:|---:|---:|---:|
+| Feature / pull request | Yes | No credentials exposed | No | No |
+| `dev` | Yes | Dev | Automatic to dev | Only when `RUN_AFTER_DEPLOY=true` |
+| `main` | Yes | Prod | Requires Jenkins approval | Only when `RUN_AFTER_DEPLOY=true` |
+
+The optional run is disabled by default because the pipeline can create or update Jira tickets and send email notifications.
+
+### Service-principal access
+
+The service principal authenticating Jenkins should normally be the same principal configured in `databricks.yml` under `run_as`. It needs:
+
+- Workspace access in both Databricks workspaces
+- `CAN_ATTACH_TO` on the existing cluster configured for the target
+- `READ` on the `collibra` Databricks secret scope
+- Permission to create and manage the deployed workflow job and bundle workspace files
+- Network/DNS access from the cluster to Collibra, PostgreSQL, Jira, MCP, and SMTP endpoints
+
+If Jenkins deploys as a different principal from `run_as`, the deployer also needs the Databricks service-principal user role for the configured run identity. PostgreSQL access is provided by the database credentials in the Databricks secret scope; the Databricks principal does not replace PostgreSQL grants.
+
+The Jenkins preflight verifies the authenticated identity, secret-scope visibility, and bundle configuration before deployment. Cluster, endpoint, and database connectivity are exercised only when the Databricks job runs.
+
+A workspace administrator can grant the configured service principal access to an existing scope with:
+
+```bash
+databricks secrets put-acl collibra \
+  9c060639-2782-4d7f-9606-841dfa9f85c3 READ \
+  -p <workspace-admin-profile>
+```
+
+If `collibra` does not exist in a workspace, create it and populate all keys listed in `DATABRICKS_SETUP.md` before applying the ACL:
+
+```bash
+databricks secrets create-scope collibra -p <workspace-admin-profile>
+```
+
+Grant `CAN_ATTACH_TO` on the target's existing cluster through the Databricks permissions UI or API. Being able to view a cluster does not by itself prove that the principal can attach workloads to it.
+
 ## How to Run
 
 ## Recommended execution order
@@ -490,8 +612,8 @@ Optional branches:
 ## Output mode behavior
 
 - `csv`: read/write only local CSV files in `outputs/`
-- `uc`: read/write only Unity Catalog tables
-- `both`: write both; read CSV first then UC fallback
+- `postgres`: read/write PostgreSQL pipeline tables
+- `both`: write both; read CSV first then PostgreSQL fallback
 
 ## Operational Notes
 
@@ -509,8 +631,11 @@ Optional branches:
   - on failure, they fall back to `config.py` values.
 
 - PostgreSQL writes:
-  - deduplicated by `(dataset, runId)` patterns.
-  - guarded to skip when DB credentials are incomplete.
+  - insert-only tables (`dqm_dashboard_by_data_domain`, `dataset_custom_rules`) are deduplicated via `ON CONFLICT DO NOTHING` on their key columns.
+  - upsert tables (`business_unit_mapping`, `dataset_definitions`) use `postgres_io.upsert_dataframe()`, only firing the `UPDATE` when a tracked column actually changed.
+  - `dataset_definitions` also prunes stale `col_name` rows per dataset via `postgres_io.delete_rows_not_in_keys()`.
+  - pipeline handoff tables use `dqm_auto_` names and transaction-local staging tables for atomic full refreshes.
+  - active pipeline stages fail when DB credentials are incomplete.
 
 - CN exclusions:
   - ticket generation and management logic intentionally excludes selected CN flows.
@@ -519,13 +644,13 @@ Optional branches:
 
 ## Common startup errors
 
-`PIPELINE_WRITE_MODE must be one of: csv, uc, both`
+`PIPELINE_WRITE_MODE must be one of: csv, postgres, both`
 
 - Verify `PIPELINE_WRITE_MODE` value.
 
-`UC_CATALOG/UC_SCHEMA not configured`
+`PostgreSQL configuration is incomplete`
 
-- Required when mode is `uc` or `both`.
+- Set `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASSWORD` or their Databricks secret equivalents.
 
 `JIRA_URL and JIRA_API_TOKEN must be configured`
 
