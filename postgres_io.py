@@ -10,7 +10,10 @@ from typing import Any, Iterable, Sequence
 import json
 import logging
 import os
+import re
+import uuid
 import pandas as pd
+from pandas.api import types as pandas_types
 import psycopg2
 import psycopg2.extras as extras
 
@@ -362,9 +365,13 @@ def _clean_value(v: Any) -> Any:
     if isinstance(v, (list, dict, tuple)):
         return json.dumps(v)
     try:
-        return None if pd.isna(v) else v
+        if pd.isna(v):
+            return None
     except (TypeError, ValueError):
         return v
+    if type(v).__module__ == "numpy" and hasattr(v, "item"):
+        return v.item()
+    return v
 
 
 @dataclass(frozen=True)
@@ -466,6 +473,135 @@ def read_table(settings: PostgresSettings, columns: Sequence[str] | None = None)
         quoted_cols = "*"
     query = f"SELECT {quoted_cols} FROM {settings.table}"
     return read_sql(query, settings)
+
+
+def _qualified_table_parts(table: str) -> tuple[str, str]:
+    """Validate and split a schema-qualified PostgreSQL table name."""
+    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)", table)
+    if not match:
+        raise ValueError(f"Invalid schema-qualified PostgreSQL table name: {table}")
+    return match.group(1), match.group(2)
+
+
+def _quoted_table(table: str) -> str:
+    schema, table_name = _qualified_table_parts(table)
+    return f'"{schema}"."{table_name}"'
+
+
+def _postgres_type(series: pd.Series) -> str:
+    """Map a pandas series to a conservative PostgreSQL column type."""
+    dtype = series.dtype
+    if pandas_types.is_bool_dtype(dtype):
+        return "boolean"
+    if pandas_types.is_integer_dtype(dtype):
+        return "bigint"
+    if pandas_types.is_float_dtype(dtype):
+        return "double precision"
+    if pandas_types.is_datetime64tz_dtype(dtype):
+        return "timestamptz"
+    if pandas_types.is_datetime64_dtype(dtype):
+        return "timestamp"
+    return "text"
+
+
+def replace_table(
+    df: pd.DataFrame,
+    settings: PostgresSettings,
+    page_size: int = 500,
+) -> int:
+    """Atomically replace a PostgreSQL snapshot table with a DataFrame.
+
+    The destination is created from DataFrame columns when needed and gains
+    newly introduced columns without dropping existing ones. Data is loaded
+    into a transaction-local staging table before the destination is truncated,
+    so concurrent readers never observe a partial refresh.
+    """
+    schema, table_name = _qualified_table_parts(settings.table)
+    quoted_target = _quoted_table(settings.table)
+    columns = [str(column) for column in df.columns]
+    if len(columns) != len(set(columns)):
+        raise ValueError(f"Duplicate DataFrame columns cannot be written to {settings.table}")
+
+    with connect(settings) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass(%s)", (settings.table,))
+            table_exists = cur.fetchone()[0] is not None
+
+            if not table_exists:
+                definitions = ", ".join(
+                    f'"{column.replace(chr(34), chr(34) * 2)}" {_postgres_type(df[column])}'
+                    for column in columns
+                )
+                cur.execute(f"CREATE TABLE {quoted_target} ({definitions})")
+            else:
+                cur.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                    """,
+                    (schema, table_name),
+                )
+                existing_columns = {row[0] for row in cur.fetchall()}
+                for column in columns:
+                    if column not in existing_columns:
+                        quoted_column = column.replace('"', '""')
+                        cur.execute(
+                            f"ALTER TABLE {quoted_target} ADD COLUMN \"{quoted_column}\" "
+                            f"{_postgres_type(df[column])}"
+                        )
+
+            if columns and not df.empty:
+                staging_name = f"dqm_auto_stage_{uuid.uuid4().hex}"
+                quoted_staging = f'"{staging_name}"'
+                cur.execute(
+                    f"CREATE TEMP TABLE {quoted_staging} "
+                    f"(LIKE {quoted_target} INCLUDING DEFAULTS) ON COMMIT DROP"
+                )
+                quoted_columns = ", ".join(
+                    f'"{column.replace(chr(34), chr(34) * 2)}"' for column in columns
+                )
+                rows = [
+                    tuple(_clean_value(value) for value in row)
+                    for row in df[columns].to_numpy()
+                ]
+                extras.execute_values(
+                    cur,
+                    f"INSERT INTO {quoted_staging} ({quoted_columns}) VALUES %s",
+                    rows,
+                    page_size=page_size,
+                )
+                cur.execute(f"TRUNCATE TABLE {quoted_target}")
+                cur.execute(
+                    f"INSERT INTO {quoted_target} ({quoted_columns}) "
+                    f"SELECT {quoted_columns} FROM {quoted_staging}"
+                )
+            else:
+                cur.execute(f"TRUNCATE TABLE {quoted_target}")
+
+    return len(df)
+
+
+def upsert_business_unit_mapping(
+    df: pd.DataFrame,
+    settings: PostgresSettings,
+) -> int:
+    """Incrementally enrich the shared business-unit mapping table."""
+    columns = (
+        "dataset", "region", "business_unit", "Market", "Project", "CDE",
+        "jobSchedule", "Data Domain", "subDomain", "connectionName", "db_nm",
+        "table_nm", "scheduleTime", "timeZone",
+    )
+    available_columns = tuple(column for column in columns if column in df.columns)
+    if "dataset" not in available_columns:
+        raise ValueError("business_unit_mapping requires a dataset column")
+    return upsert_dataframe(
+        df=df,
+        settings=settings,
+        key_columns=("dataset",),
+        all_columns=available_columns,
+        change_detect_columns=available_columns[1:],
+    )
 
 
 def insert_on_conflict_do_nothing(
