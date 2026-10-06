@@ -25,13 +25,18 @@ targets:
       host: https://dbc-1a2fed98-ca15.cloud.databricks.com
     variables:
       cluster_id: 1023-021822-wqfpujup
+    run_as:
+      service_principal_name: 9c060639-2782-4d7f-9606-841dfa9f85c3
+
   prod:
     mode: production
     workspace:
       host: https://dbc-1d2e2f8a-2140.cloud.databricks.com
+      root_path: /Workspace/Users/9c060639-2782-4d7f-9606-841dfa9f85c3/.bundle/${bundle.name}/${bundle.target}
     variables:
       cluster_id: 0128-064509-tf6od0jl
-
+    run_as:
+      service_principal_name: 9c060639-2782-4d7f-9606-841dfa9f85c3
 
 
 resources:
@@ -44,11 +49,29 @@ resources:
         timezone_id: "Asia/Singapore"
         pause_status: UNPAUSED
 
+      email_notifications:
+        on_failure:
+          - mchen154@its.jnj.com
+          - bchen109@its.jnj.com
+          - DDenny1@ITS.JNJ.com
+          - SSrini12@its.jnj.com
+          - kshum1@ITS.JNJ.com
+
       permissions:
         - level: CAN_VIEW
           group_name: users
         - level: CAN_MANAGE
           user_name: mchen154@its.jnj.com
+        - level: CAN_MANAGE
+          user_name: bchen109@its.jnj.com
+        - level: CAN_MANAGE
+          user_name: DDenny1@ITS.JNJ.com
+        - level: CAN_MANAGE
+          user_name: SSrini12@its.jnj.com
+        - level: CAN_MANAGE
+          user_name: kshum1@ITS.JNJ.com
+        - level: CAN_MANAGE
+          service_principal_name: 9c060639-2782-4d7f-9606-841dfa9f85c3
 
       tasks:
         # Stage 1: Query Datasets and Business Units from Collibra
