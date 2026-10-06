@@ -96,7 +96,7 @@ Configuration Parameters
 
 Environment Variables
 ---------------------
-- PIPELINE_WRITE_MODE        : csv | uc | both  (default: csv)
+- PIPELINE_WRITE_MODE        : csv | postgres | both  (default: csv)
 - PIPELINE_LOCAL_OUTPUT_DIR  : path for CSV outputs  (default: ./outputs)
 - S8_MAX_SEED_ISSUES         : Max seed issues for search (default: 15)
 
@@ -104,7 +104,7 @@ Secrets (Databricks secret scope "collibra", or config.py fallback)
 --------------------------------------------------------------------
 - jira_url / jira_api_token / jira_ca_bundle
 - jnj_gateway_url / jnj_gateway_key  (Claude gateway for LLM)
-- uc_catalog / uc_schema
+- db_host / db_port / db_name / db_user / db_password
 
 Signal Extraction Patterns
 ---------------------------
@@ -179,9 +179,6 @@ def parse_bool(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-uc_catalog = _load_secret_or_default("uc_catalog", getattr(config, "UC_CATALOG", None))
-uc_schema = _load_secret_or_default("uc_schema", getattr(config, "UC_SCHEMA", None))
-
 pipeline_io = PipelineIO(
     write_mode=WRITE_MODE,
     local_output_dir=LOCAL_OUTPUT_DIR,
@@ -189,10 +186,7 @@ pipeline_io = PipelineIO(
     spark=globals().get("spark"),
     config_module=config,
     secret_scope=SECRET_SCOPE,
-    uc_catalog=uc_catalog,
-    uc_schema=uc_schema,
     logger=logger,
-    sanitize_uc_table_names=True,
 )
 read_input = pipeline_io.read_input
 write_output = pipeline_io.write_output
