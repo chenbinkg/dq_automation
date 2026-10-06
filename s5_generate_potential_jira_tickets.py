@@ -67,7 +67,7 @@ Processing Flow
 
 Environment Variables
 ---------------------
-- PIPELINE_WRITE_MODE        : csv | uc | both  (default: csv)
+- PIPELINE_WRITE_MODE        : csv | postgres | both  (default: csv)
 - PIPELINE_LOCAL_OUTPUT_DIR  : path for CSV outputs  (default: ./outputs)
 
 Secrets (Databricks secret scope "collibra", or config.py fallback)
@@ -75,7 +75,7 @@ Secrets (Databricks secret scope "collibra", or config.py fallback)
 - jira_url
 - jira_api_token
 - jira_ca_bundle  (optional, for SSL verification)
-- uc_catalog / uc_schema  (required when PIPELINE_WRITE_MODE != csv)
+- db_host / db_port / db_name / db_user / db_password
 
 External Integrations
 ----------------------
@@ -154,8 +154,6 @@ username_apac = _load_secret_or_default("username_apac", config.COLLIBRA_USERNAM
 password_apac = _load_secret_or_default("password_apac", config.COLLIBRA_PASSWORD_APAC)
 username_cn = _load_secret_or_default("username_cn", config.COLLIBRA_USERNAME_CN)
 password_cn = _load_secret_or_default("password_cn", config.COLLIBRA_PASSWORD_CN)
-uc_catalog = _load_secret_or_default("uc_catalog", getattr(config, "UC_CATALOG", None))
-uc_schema = _load_secret_or_default("uc_schema", getattr(config, "UC_SCHEMA", None))
 
 
 postgres_settings = settings_for_table(
@@ -212,10 +210,7 @@ pipeline_io = PipelineIO(
     spark=globals().get("spark"),
     config_module=config,
     secret_scope=SECRET_SCOPE,
-    uc_catalog=uc_catalog,
-    uc_schema=uc_schema,
     logger=logger,
-    sanitize_uc_table_names=True,
 )
 
 read_input = pipeline_io.read_input
